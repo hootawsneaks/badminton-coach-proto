@@ -103,11 +103,10 @@ with tab_live:
 
         def cb(frame):
             img = frame.to_ndarray(format="bgr24")
-            img = img[:, ::-1].copy()  # mirror like a mirror
             if img.shape[1] > 960:
                 import cv2
                 img = cv2.resize(img, (960, int(img.shape[0] * 960 / img.shape[1])))
-            return av.VideoFrame.from_ndarray(holder["la"].process(img), format="bgr24")
+            return av.VideoFrame.from_ndarray(holder["la"].process(img, mirror=True), format="bgr24")
 
         webrtc_streamer(key="live", video_frame_callback=cb,
                         media_stream_constraints={"video": True, "audio": False},
