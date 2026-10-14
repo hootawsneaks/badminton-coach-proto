@@ -1,0 +1,7 @@
+mediapipe>=0.10.30
+opencv-python
+numpy
+pandas
+streamlit
+streamlit-webrtc
+imageio-ffmpeg
