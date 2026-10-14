@@ -141,6 +141,9 @@ def detect(landmarker, bgr: np.ndarray, ts_ms: int | None = None):
     lm = res.pose_landmarks[0]
     xy = np.array([[p.x * w, p.y * h] for p in lm])
     vis = np.array([getattr(p, "visibility", 1.0) or 0.0 for p in lm])
+    # The model extrapolates joints that are off-screen; treat those (and near-zero visibility) as missing.
+    inside = (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h) & (vis >= 0.15)
+    xy[~inside] = np.nan
     return xy, vis
 
 
@@ -172,6 +175,26 @@ def extract_video(path: str, max_width: int = 960, progress_cb=None):
     return dict(kps=np.array(kps), vis=np.array(viss), fps=fps, frames=frames)
 
 
+# ---------------------------------------------------------------- framing check
+FRAME_HINT = "Body not fully in frame - step back 2-3 m so you are visible from head to feet"
+
+
+def _ok(p) -> bool:
+    return not np.isnan(p).any()
+
+
+def body_in_frame(xy) -> bool:
+    """One frame: torso, at least one full leg and at least one full arm are visible on screen."""
+    torso = all(_ok(xy[i]) for i in (L_SH, R_SH, L_HIP, R_HIP))
+    leg = any(all(_ok(xy[i]) for i in leg_) for leg_ in ((L_HIP, L_KN, L_AN), (R_HIP, R_KN, R_AN)))
+    arm = any(all(_ok(xy[i]) for i in arm_) for arm_ in ((L_SH, L_EL, L_WR), (R_SH, R_EL, R_WR)))
+    return torso and leg and arm
+
+
+def frame_coverage(kps: np.ndarray) -> float:
+    return float(np.mean([body_in_frame(k) for k in kps])) if len(kps) else 0.0
+
+
 # ---------------------------------------------------------------- analysis
 def _arm_idx(arm: str):
     return (R_SH, R_EL, R_WR) if arm == "right" else (L_SH, L_EL, L_WR)
@@ -186,6 +209,8 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
     det = ~np.isnan(kps[:, NOSE, 0])
     if det.mean() < 0.5:
         return Report(False, "Player not detected in enough frames - frame the whole body, side-on, good light")
+    if frame_coverage(kps) < 0.6:
+        return Report(False, FRAME_HINT)
     k = _smooth(_interp_nan(kps), cfg.smooth_win)
 
     mid_sh = (k[:, L_SH] + k[:, R_SH]) / 2

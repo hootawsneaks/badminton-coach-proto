@@ -67,6 +67,9 @@ class LiveAnalyzer:
         # HUD
         if np.isnan(xy[A.NOSE, 0]):
             A.put_text(im, "No player detected - step back so your whole body is visible", (20, 40), 0.7, bg=(0, 0, 150))
+        elif not A.body_in_frame(xy):
+            A.put_text(im, A.FRAME_HINT[:78], (20, 40), 0.65, bg=(0, 0, 150))
+            self.report = None   # don't keep showing a stale score while badly framed
         r = self.report
         if r and now - self.report_t < 6.0:
             col = (0, 130, 0) if r.score >= 75 else (0, 110, 200) if r.score >= 50 else (0, 0, 170)

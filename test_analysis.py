@@ -58,4 +58,8 @@ if __name__ == "__main__":
     still = np.tile(make_swing(True)[0], (40, 1, 1))
     assert not A.analyze(still, FPS).ok
     assert not A.analyze(np.full((40, 33, 2), np.nan), FPS).ok
+    # partially visible body (legs cut off) must be refused, not scored
+    cut = make_swing(True).copy(); cut[:, [A.L_KN, A.R_KN, A.L_AN, A.R_AN]] = np.nan
+    r = A.analyze(cut, FPS, A.Config(swing_speed_thresh=1.0))
+    assert not r.ok and "frame" in r.reason.lower(), r.reason
     print("ALL TESTS PASSED")
