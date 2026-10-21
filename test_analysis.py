@@ -41,6 +41,38 @@ def run(good):
     return A.analyze(make_swing(good), FPS, A.Config(swing_speed_thresh=1.0))
 
 
+def test_live_pause_and_redo():
+    """Live mode: arming -> ready -> swing freezes on a result card -> reset() starts over."""
+    import live as L
+    clock = {"t": 0.0}
+    L.time.time = lambda: clock["t"]
+    A.make_landmarker = lambda video_mode=True: type("LM", (), {"close": lambda self: None})()
+    swing = make_swing(True, n=80)
+    frame = {"i": 0}
+    A.detect = lambda lm, bgr, ts=None: (swing[min(frame["i"], len(swing) - 1)], np.ones(33))
+    la = L.LiveAnalyzer(A.Config(swing_speed_thresh=1.0), arm_s=0.5)
+    img = np.zeros((480, 640, 3), np.uint8)
+
+    def step(i):
+        frame["i"] = i
+        clock["t"] += 1 / FPS
+        return la.process(img)
+
+    for _ in range(20):          # standing still during arming
+        step(0)
+    assert la.state == "ready", la.state
+    for i in range(80):
+        step(i)
+        if la.state == "result":
+            break
+    assert la.state == "result" and la.report is not None
+    frozen = step(0)
+    assert np.array_equal(frozen, step(10)), "display should stay frozen on the result card"
+    x0, y0, x1, y1 = la.redo_rect
+    assert la.click((x0 + x1) // 2, (y0 + y1) // 2) and la.state == "arming"
+    assert len(la.history) == 1
+
+
 if __name__ == "__main__":
     g, b = run(True), run(False)
     for name, r in (("GOOD", g), ("BAD", b)):
@@ -62,4 +94,10 @@ if __name__ == "__main__":
     cut = make_swing(True).copy(); cut[:, [A.L_KN, A.R_KN, A.L_AN, A.R_AN]] = np.nan
     r = A.analyze(cut, FPS, A.Config(swing_speed_thresh=1.0))
     assert not r.ok and "frame" in r.reason.lower(), r.reason
+    # grading
+    assert g.grade in "ABCDF" and A.letter(95) == "A" and A.letter(10) == "F"
+    assert A.points(170, 150, 170) == 100 and A.points(150, 150, 170) == 60
+    assert A.points(140, 165, 140) == 100   # lower-is-better metric (knee angle)
+    test_live_pause_and_redo()
     print("ALL TESTS PASSED")
+

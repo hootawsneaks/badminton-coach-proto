@@ -7,17 +7,19 @@ import streamlit as st
 
 import analysis as A
 
-st.set_page_config(page_title="Badminton Form Coach", layout="wide")
-st.title("Badminton Form Coach")
-st.caption("Computer-vision form correction for overhead clears and smashes. "
-           "Pose estimation -> swing detection -> joint-angle checks -> coaching feedback.")
+st.set_page_config(page_title="Badminton Smash Coach", layout="wide")
+st.title("Badminton Smash Coach")
+st.caption("Computer-vision smash analysis. Pose estimation -> swing detection -> "
+           "metrics graded against a smash benchmark -> letter grade + coaching feedback.")
 
 # ------------------------------------------------------------ sidebar: thresholds
 d = A.Config()
 with st.sidebar:
-    st.header("Form thresholds")
-    st.caption("Heuristic defaults, tunable per coach / skill level. Not validated clinical norms.")
+    st.header("Smash pass lines")
+    st.caption("Below the pass line = FIX. Full marks at the benchmark (see analysis.Config). "
+               "Demo placeholder numbers, not validated norms.")
     cfg = A.Config(
+        min_smash_speed=st.slider("Min racket-hand speed (torso/s)", 2.0, 20.0, d.min_smash_speed, 0.5),
         min_elbow_extension_deg=st.slider("Min elbow extension at contact (deg)", 120, 180, int(d.min_elbow_extension_deg)),
         min_contact_height=st.slider("Min contact height (torso above shoulder)", 0.0, 1.5, d.min_contact_height, 0.05),
         min_trophy_elbow_height=st.slider("Min prep elbow height (rel. shoulder)", -0.6, 0.4, d.min_trophy_elbow_height, 0.05),
@@ -36,12 +38,16 @@ def show_report(rep: A.Report):
     if not rep.ok:
         st.warning(rep.reason)
         return
-    c1, c2 = st.columns([1, 3])
-    c1.metric("Form score", f"{rep.score:.0f} / 100")
-    c1.caption(f"Racket arm: {rep.arm}")
+    c1, c2 = st.columns(2)
+    c1.metric("Smash grade", rep.grade)
+    c2.metric("Score", f"{rep.score:.0f} / 100")
+    st.caption(f"Racket arm: {rep.arm}")
+    if rep.top_fix:
+        st.warning(f"**Top fix** - {rep.top_fix}")
     for ch in rep.checks:
         fn = {"good": st.success, "warn": st.error, "info": st.info}.get(ch.status, st.write)
-        fn(f"**{ICON[ch.status]} - {ch.name}** (target {ch.target}): {ch.message}")
+        pts = f" - {ch.points:.0f}/100" if ch.points is not None else ""
+        fn(f"**{ICON[ch.status]} - {ch.name}**{pts} (pass {ch.target}): {ch.message}")
 
 
 with tab_video:
@@ -87,7 +93,8 @@ with tab_video:
                 col.image(cv2.cvtColor(im, cv2.COLOR_BGR2RGB), caption=f"{lab} (frame {idx})")
 
 with tab_live:
-    st.write("Real-time mode: stand so your whole body is visible, take a swing, and feedback appears on the video after each stroke.")
+    st.write("Real-time mode: stand so your whole body is visible and smash. The video freezes on your "
+             "contact frame with your grade; press **Redo** to try again.")
     try:
         from streamlit_webrtc import webrtc_streamer
         import av
@@ -107,6 +114,9 @@ with tab_live:
                 import cv2
                 img = cv2.resize(img, (960, int(img.shape[0] * 960 / img.shape[1])))
             return av.VideoFrame.from_ndarray(holder["la"].process(img, mirror=True), format="bgr24")
+
+        if st.button("Redo", type="primary"):
+            holder["la"].reset()
 
         webrtc_streamer(key="live", video_frame_callback=cb,
                         media_stream_constraints={"video": True, "audio": False},

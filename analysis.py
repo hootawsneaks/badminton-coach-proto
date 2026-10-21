@@ -34,11 +34,23 @@ SKELETON = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24)
 
 @dataclass
 class Config:
-    # --- checks (heuristic defaults) ---
+    # Smash benchmark. Each metric has a pass line (below it = "FIX") and a benchmark (= full marks).
+    # These are DEMO placeholder numbers, not measured from real players - tune them against coach-rated clips.
     min_elbow_extension_deg: float = 150.0   # hitting-arm elbow angle at contact
+    bench_elbow_extension_deg: float = 170.0
     min_contact_height: float = 0.60         # wrist above shoulder, in torso lengths
+    bench_contact_height: float = 0.95
     min_trophy_elbow_height: float = -0.15   # elbow vs shoulder at prep (torso lengths; >= means ~level/high)
+    bench_trophy_elbow_height: float = 0.10
     max_knee_angle_prep: float = 165.0       # some knee flexion (loading) before the swing
+    bench_knee_angle_prep: float = 140.0
+    min_smash_speed: float = 7.0             # peak racket-hand speed, torso-lengths / second
+    bench_smash_speed: float = 14.0
+    min_follow_through: float = 0.0          # how far the wrist drops below the shoulder after contact (torso lengths)
+    bench_follow_through: float = 0.6
+    max_swing_time_s: float = 0.45           # prep -> contact time (shorter = more explosive)
+    bench_swing_time_s: float = 0.20
+    follow_window_s: float = 0.5             # look-ahead window after contact for the follow-through
     # --- swing detection ---
     swing_speed_thresh: float = 4.0          # wrist speed, torso-lengths / second
     prep_window_s: float = 0.7               # look-back window from contact for the prep phase
@@ -52,6 +64,9 @@ class Check:
     target: str
     status: str            # "good" | "warn" | "info" | "na"
     message: str
+    points: float | None = None   # 0-100 vs benchmark (None = not scored)
+    weight: float = 0.0
+    bench: str = ""
 
 
 @dataclass
@@ -63,6 +78,8 @@ class Report:
     prep_idx: int = -1
     checks: list = field(default_factory=list)
     score: float | None = None
+    grade: str = ""
+    top_fix: str = ""
     speed: np.ndarray | None = None
     elbow: np.ndarray | None = None
     fps: float = 30.0
@@ -195,6 +212,26 @@ def frame_coverage(kps: np.ndarray) -> float:
     return float(np.mean([body_in_frame(k) for k in kps])) if len(kps) else 0.0
 
 
+# ---------------------------------------------------------------- grading
+# Weights of each smash metric in the overall score (sum to 1).
+WEIGHTS = {"speed": 0.25, "extension": 0.20, "height": 0.20, "follow": 0.10,
+           "prep": 0.10, "knee": 0.10, "tempo": 0.05}
+
+
+def points(value: float, pass_line: float, bench: float) -> float:
+    """0-100 credit: 60 at the pass line, 100 at the benchmark, linear (works for lower-is-better too)."""
+    if value is None or np.isnan(value) or bench == pass_line:
+        return 0.0
+    return float(np.clip(60 + 40 * (value - pass_line) / (bench - pass_line), 0, 100))
+
+
+def letter(score: float) -> str:
+    for cut, g in ((90, "A"), (80, "B"), (70, "C"), (60, "D")):
+        if score >= cut:
+            return g
+    return "F"
+
+
 # ---------------------------------------------------------------- analysis
 def _arm_idx(arm: str):
     return (R_SH, R_EL, R_WR) if arm == "right" else (L_SH, L_EL, L_WR)
@@ -246,45 +283,65 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
 
     checks: list[Check] = []
 
-    # 1. elbow extension at contact
-    e_c = float(elbow[contact])
-    checks.append(Check("Arm extension at contact", e_c, f">= {cfg.min_elbow_extension_deg:.0f} deg",
-                        "good" if e_c >= cfg.min_elbow_extension_deg else "warn",
-                        f"Elbow {e_c:.0f} deg - " + ("arm well extended." if e_c >= cfg.min_elbow_extension_deg
-                        else "reach up and straighten the arm at contact to hit at the highest point.")))
+    def add(key, name, value, pass_line, bench, unit, good_msg, fix_msg, fmt="{:.0f}"):
+        if value is None or np.isnan(value):
+            checks.append(Check(name, None, "", "na", "Not measurable in this clip.", None, WEIGHTS[key]))
+            return
+        higher = bench > pass_line
+        ok = value >= pass_line if higher else value <= pass_line
+        op = ">=" if higher else "<="
+        v = fmt.format(value)
+        checks.append(Check(name, float(value), f"{op} {fmt.format(pass_line)}{unit}",
+                            "good" if ok else "warn",
+                            f"{v}{unit} (benchmark {fmt.format(bench)}{unit}) - " + (good_msg if ok else fix_msg),
+                            points(value, pass_line, bench), WEIGHTS[key], f"{fmt.format(bench)}{unit}"))
 
-    # 2. contact height
-    ch = float((k[contact, sh_i, 1] - k[contact, wr_i, 1]) / torso)
-    checks.append(Check("Contact height", ch, f">= {cfg.min_contact_height:.2f} torso above shoulder",
-                        "good" if ch >= cfg.min_contact_height else "warn",
-                        f"Contact {ch:.2f} torso-lengths above shoulder - " + ("high contact point." if ch >= cfg.min_contact_height
-                        else "you are hitting too low; get under the shuttle and hit at full reach.")))
+    # 1. racket-hand speed (the "smash power" proxy)
+    add("speed", "Racket-hand speed", float(speed[c]), cfg.min_smash_speed, cfg.bench_smash_speed, " torso/s",
+        "explosive swing.", "swing faster - snap the forearm (pronation) and whip through the shuttle.", "{:.1f}")
 
-    # 3. trophy-position elbow height
-    eh = float((k[prep, sh_i, 1] - k[prep, el_i, 1]) / torso)
-    checks.append(Check("Preparation elbow height", eh, f">= {cfg.min_trophy_elbow_height:.2f}",
-                        "good" if eh >= cfg.min_trophy_elbow_height else "warn",
-                        ("Elbow raised to about shoulder level in the preparation phase." if eh >= cfg.min_trophy_elbow_height
-                         else "Elbow drops below the shoulder in preparation - lift the elbow to build a proper 'trophy' position.")))
+    # 2. elbow extension at contact
+    add("extension", "Arm extension at contact", float(elbow[contact]), cfg.min_elbow_extension_deg,
+        cfg.bench_elbow_extension_deg, " deg", "arm well extended.",
+        "reach up and straighten the arm at contact to hit at the highest point.")
 
-    # 4. knee loading (use the more flexed knee in the prep window)
+    # 3. contact height
+    add("height", "Contact height", float((k[contact, sh_i, 1] - k[contact, wr_i, 1]) / torso),
+        cfg.min_contact_height, cfg.bench_contact_height, " torso", "high contact point.",
+        "hitting too low; get under and slightly behind the shuttle and hit at full reach.", "{:.2f}")
+
+    # 4. follow-through: a smash finishes down and across the body
+    fend = min(N, contact + 1 + int(cfg.follow_window_s * fps))
+    ft = float(np.max(k[contact + 1:fend, wr_i, 1] - k[contact + 1:fend, sh_i, 1]) / torso) \
+        if fend - contact > 3 else float("nan")
+    add("follow", "Downward follow-through", ft, cfg.min_follow_through, cfg.bench_follow_through, " torso",
+        "racket follows through down past the shoulder.",
+        "finish the swing down and across your body - don't stop the racket after contact.", "{:.2f}")
+
+    # 5. trophy-position elbow height
+    add("prep", "Preparation elbow height", float((k[prep, sh_i, 1] - k[prep, el_i, 1]) / torso),
+        cfg.min_trophy_elbow_height, cfg.bench_trophy_elbow_height, " torso",
+        "elbow up in a good 'trophy' position.",
+        "elbow drops below the shoulder in preparation - lift it to build the 'trophy' position.", "{:.2f}")
+
+    # 6. knee loading (use the more flexed knee in the prep window)
     kn = []
-    for (kk, hh, aa) in (( knee_i, hip_i, ank_i), other):
+    for (kk, hh, aa) in ((knee_i, hip_i, ank_i), other):
         kn.append(np.nanmin([angle(k[t, hh], k[t, kk], k[t, aa]) for t in range(plo, contact + 1)]))
-    knee = float(np.nanmin(kn))
-    checks.append(Check("Knee loading", knee, f"<= {cfg.max_knee_angle_prep:.0f} deg",
-                        "good" if knee <= cfg.max_knee_angle_prep else "warn",
-                        f"Min knee angle {knee:.0f} deg - " + ("good leg load before the swing." if knee <= cfg.max_knee_angle_prep
-                        else "legs are stiff; bend the knees and push up through the stroke for power.")))
+    add("knee", "Knee loading", float(np.nanmin(kn)), cfg.max_knee_angle_prep, cfg.bench_knee_angle_prep, " deg",
+        "good leg load before the swing.", "legs are stiff; bend the knees and jump/push up into the smash.")
 
-    # 5. swing speed (informational: compare attempts, not an absolute pass/fail)
-    checks.append(Check("Peak racket-hand speed", float(speed[c]), "higher = more power (compare attempts)",
-                        "info", f"{speed[c]:.1f} torso-lengths/s"))
+    # 7. swing tempo: prep -> contact
+    add("tempo", "Swing tempo", (contact - prep) / fps, cfg.max_swing_time_s, cfg.bench_swing_time_s, " s",
+        "quick, explosive acceleration.", "the swing is slow from prep to contact; accelerate late and hard.", "{:.2f}")
 
-    scored = [x for x in checks if x.status in ("good", "warn")]
-    score = 100.0 * sum(x.status == "good" for x in scored) / max(1, len(scored))
+    scored = [x for x in checks if x.points is not None]
+    wsum = sum(x.weight for x in scored)
+    score = sum(x.points * x.weight for x in scored) / wsum if wsum else 0.0
+    fixes = sorted((x for x in scored if x.status == "warn"), key=lambda x: -(100 - x.points) * x.weight)
+    top_fix = f"{fixes[0].name}: {fixes[0].message.split(' - ', 1)[-1]}" if fixes else ""
     return Report(True, arm=arm, contact_idx=contact, prep_idx=prep, checks=checks, score=score,
-                  speed=speed, elbow=elbow, fps=fps)
+                  grade=letter(score), top_fix=top_fix, speed=speed, elbow=elbow, fps=fps)
 
 
 # ---------------------------------------------------------------- drawing
@@ -330,7 +387,7 @@ def annotate_video(frames, kps, rep: Report, fps: float, out_path: str):
             if lab:
                 put_text(im, lab, (20, 40), 1.0, (255, 255, 255), (0, 120, 255) if lab == "CONTACT" else (160, 90, 0), 2)
             if t >= rep.contact_idx:
-                put_text(im, f"Form score {rep.score:.0f}/100", (20, h - 20), 0.9, (255, 255, 255),
+                put_text(im, f"Smash grade {rep.grade}  ({rep.score:.0f}/100)", (20, h - 20), 0.9, (255, 255, 255),
                          (0, 130, 0) if rep.score >= 75 else (0, 110, 200) if rep.score >= 50 else (0, 0, 170), 2)
         wr.write(im)
     wr.release()
