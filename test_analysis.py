@@ -41,12 +41,36 @@ def run(good):
     return A.analyze(make_swing(good), FPS, A.Config(swing_speed_thresh=1.0))
 
 
+def make_smash(fps, dur=2.0):
+    """Wrist rises to a high contact (~0.96 torso above the shoulder) at t=1.0s, then whips down past the hip."""
+    n = int(dur * fps); base = make_swing(True)[0]
+    k = np.tile(base, (n, 1, 1)).astype(float)
+    sh = base[A.R_SH]
+    for i in range(n):
+        t = i / fps
+        if t < 0.7: y = sh[1] + 20
+        elif t < 1.0: y = sh[1] + 20 - (t - 0.7) / 0.3 * 135
+        elif t < 1.15: y = sh[1] - 115 + (t - 1.0) / 0.15 * 230
+        else: y = sh[1] + 115
+        k[i, A.R_WR] = (sh[0] + 10, y); k[i, A.R_EL] = (sh[0] + 8, (sh[1] + y) / 2)
+    return k
+
+
+def test_contact_height_at_low_fps():
+    """A high contact followed by a big follow-through must score well on BOTH, even at live-camera frame rates."""
+    for fps in (10, 15, 30):
+        r = A.analyze(make_smash(fps), fps, A.Config(swing_speed_thresh=1.0))
+        v = {c.name: c.value for c in r.checks}
+        assert v["Contact height"] > 0.75, (fps, v["Contact height"])
+        assert v["Downward follow-through"] > 0.6, (fps, v["Downward follow-through"])
+
+
 def test_live_pause_and_redo():
     """Live mode: arming -> ready -> swing freezes on a result card -> reset() starts over."""
     import live as L
     clock = {"t": 0.0}
     L.time.time = lambda: clock["t"]
-    A.make_landmarker = lambda video_mode=True: type("LM", (), {"close": lambda self: None})()
+    A.make_landmarker = lambda video_mode=True, lite=False: type("LM", (), {"close": lambda self: None})()
     swing = make_swing(True, n=80)
     frame = {"i": 0}
     A.detect = lambda lm, bgr, ts=None: (swing[min(frame["i"], len(swing) - 1)], np.ones(33))
@@ -98,6 +122,7 @@ if __name__ == "__main__":
     assert g.grade in "ABCDF" and A.letter(95) == "A" and A.letter(10) == "F"
     assert A.points(170, 150, 170) == 100 and A.points(150, 150, 170) == 60
     assert A.points(140, 165, 140) == 100   # lower-is-better metric (knee angle)
+    test_contact_height_at_low_fps()
     test_live_pause_and_redo()
     print("ALL TESTS PASSED")
 

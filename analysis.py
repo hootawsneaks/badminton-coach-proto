@@ -18,6 +18,9 @@ import numpy as np
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "pose_landmarker_full.task")
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
              "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
+# Lighter, faster model for live mode (higher frame rate, a bit less precise on fast wrists).
+LITE_MODEL_PATH = MODEL_PATH.replace("_full", "_lite")
+LITE_MODEL_URL = MODEL_URL.replace("_full", "_lite")
 
 # MediaPipe BlazePose landmark indices
 NOSE = 0
@@ -54,7 +57,8 @@ class Config:
     # --- swing detection ---
     swing_speed_thresh: float = 4.0          # wrist speed, torso-lengths / second
     prep_window_s: float = 0.7               # look-back window from contact for the prep phase
-    smooth_win: int = 5
+    smooth_s: float = 0.1                    # keypoint smoothing window in seconds (scaled to the frame rate)
+    contact_lookback_s: float = 0.3          # wrist speed peaks on the downswing, so search this far back for contact
 
 
 @dataclass
@@ -113,6 +117,10 @@ def _interp_nan(arr: np.ndarray) -> np.ndarray:
     return flat.reshape(out.shape)
 
 
+def win_frames(seconds: float, fps: float) -> int:
+    return max(1, int(round(seconds * fps)))
+
+
 def _smooth(x: np.ndarray, w: int) -> np.ndarray:
     if w <= 1 or len(x) < w:
         return x
@@ -126,18 +134,19 @@ def _smooth(x: np.ndarray, w: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- pose
-def ensure_model():
-    if not os.path.exists(MODEL_PATH):
+def ensure_model(path: str = MODEL_PATH, url: str = MODEL_URL):
+    if not os.path.exists(path):
         import urllib.request
-        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        urllib.request.urlretrieve(url, path)
 
 
-def make_landmarker(video_mode: bool = True):
+def make_landmarker(video_mode: bool = True, lite: bool = False):
     from mediapipe.tasks.python import vision, BaseOptions
-    ensure_model()
+    path, url = (LITE_MODEL_PATH, LITE_MODEL_URL) if lite else (MODEL_PATH, MODEL_URL)
+    ensure_model(path, url)
     opts = vision.PoseLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        base_options=BaseOptions(model_asset_path=path),
         running_mode=vision.RunningMode.VIDEO if video_mode else vision.RunningMode.IMAGE,
         num_poses=1,
         min_pose_detection_confidence=0.5,
@@ -248,7 +257,10 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
         return Report(False, "Player not detected in enough frames - frame the whole body, side-on, good light")
     if frame_coverage(kps) < 0.6:
         return Report(False, FRAME_HINT)
-    k = _smooth(_interp_nan(kps), cfg.smooth_win)
+    # Smoothing is time-based: a fixed 5-frame window at a ~10 fps live feed spans half a second
+    # and flattens the top of the swing, which made contact look low and the follow-through huge.
+    sw = win_frames(cfg.smooth_s, fps)
+    k = _smooth(_interp_nan(kps), sw)
 
     mid_sh = (k[:, L_SH] + k[:, R_SH]) / 2
     mid_hip = (k[:, L_HIP] + k[:, R_HIP]) / 2
@@ -258,7 +270,7 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
 
     def speed_of(wr):
         v = np.zeros(N); v[1:] = np.linalg.norm(np.diff(k[:, wr], axis=0), axis=1) * fps / torso
-        return _smooth(v, 3)
+        return _smooth(v, sw)
 
     sp = {"right": speed_of(R_WR), "left": speed_of(L_WR)}
     if arm is None:
@@ -274,8 +286,10 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
                       speed=speed, fps=fps, arm=arm)
 
     elbow = np.array([angle(k[t, sh_i], k[t, el_i], k[t, wr_i]) for t in range(N)])
-    # contact: highest wrist point shortly around the speed peak
-    lo, hi = max(0, c - int(0.12 * fps)), min(N, c + int(0.12 * fps) + 1)
+    # contact: highest wrist point around the speed peak. In a smash the hand is fastest just *after*
+    # contact on the way down, so look mostly backwards (and always at least a couple of frames).
+    back, fwd = max(2, int(round(cfg.contact_lookback_s * fps))), max(1, int(round(0.1 * fps)))
+    lo, hi = max(0, c - back), min(N, c + fwd + 1)
     contact = lo + int(np.argmin(k[lo:hi, wr_i, 1]))   # smallest y = highest
     win = max(3, int(cfg.prep_window_s * fps))
     plo = max(0, contact - win)
@@ -371,7 +385,7 @@ def put_text(img, text, org, scale=0.7, color=(255, 255, 255), bg=(0, 0, 0), thi
 def annotate_video(frames, kps, rep: Report, fps: float, out_path: str):
     """Write annotated video with skeleton, live elbow angle, phase labels and result banner."""
     h, w = frames[0].shape[:2]
-    k = _smooth(_interp_nan(kps), 5)
+    k = _smooth(_interp_nan(kps), win_frames(0.1, fps))
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     wr = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
     hold = int(0.8 * fps)

@@ -7,12 +7,14 @@ Flow: get ready -> swing -> the screen freezes on your contact frame with a grad
 click REDO (or press r) to try again.
 
 Run standalone:  python live.py            (webcam 0)
+                 python live.py --lite     (faster, lighter pose model -> higher frame rate)
                  python live.py clip.mp4   (replay a file in real time)
 Keys: r = redo, q = quit.
 """
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from collections import deque
 
@@ -32,9 +34,9 @@ class LiveAnalyzer:
       result - swing captured: the display freezes on the contact frame with the grade card until reset()
     """
 
-    def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5):
+    def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5, lite: bool = False):
         self.cfg = cfg or A.Config()
-        self.lm = A.make_landmarker(video_mode=True)
+        self.lm = A.make_landmarker(video_mode=True, lite=lite)
         self.buffer_s = buffer_s
         self.arm_s = arm_s
         self._last_ts = -1
@@ -119,7 +121,7 @@ class LiveAnalyzer:
 
     def _render_result(self, r: A.Report, kps: np.ndarray, mirror: bool) -> np.ndarray:
         """Frozen contact frame + grade card + REDO button."""
-        k = A._smooth(A._interp_nan(kps), 5)
+        k = A._smooth(A._interp_nan(kps), A.win_frames(0.1, r.fps))
         im, xy_d = self._display(self.buf[r.contact_idx][2], k[r.contact_idx], mirror)
         A.draw_pose(im, xy_d, highlight_arm=r.arm)
         h, w = im.shape[:2]
@@ -183,12 +185,46 @@ def _wrap(text: str, width: int):
     return lines + ([cur] if cur else [])
 
 
+class CameraReader:
+    """Grabs webcam frames on a background thread so pose detection never waits on the camera;
+    read() always returns the newest frame (older ones are dropped)."""
+
+    def __init__(self, cap):
+        self.cap, self.frame, self.seq, self.ok = cap, None, 0, True
+        self.cond = threading.Condition()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while self.ok:
+            ok, fr = self.cap.read()
+            with self.cond:
+                self.ok, self.frame = ok, fr
+                self.seq += 1
+                self.cond.notify_all()
+
+    def read(self, last_seq: int):
+        """Block until a frame newer than last_seq arrives; returns (ok, frame, seq)."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.seq > last_seq or not self.ok, timeout=1.0)
+            return self.ok and self.frame is not None, self.frame, self.seq
+
+    def stop(self):
+        self.ok = False
+
+
 def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else 0
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    lite = "--lite" in sys.argv
+    src = args[0] if args else 0
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         sys.exit("Cannot open video source")
-    la = LiveAnalyzer()
+    live_cam = isinstance(src, int)
+    if live_cam:
+        cap.set(cv2.CAP_PROP_FPS, 60)          # ask for the camera's fastest mode; ignored if unsupported
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    reader = CameraReader(cap) if live_cam else None
+    la = LiveAnalyzer(lite=lite)
     win = "Badminton smash coach (r = redo, q = quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win, lambda ev, x, y, *_: la.click(x, y) if ev == cv2.EVENT_LBUTTONDOWN else None)
@@ -199,20 +235,29 @@ def main():
     except Exception:
         pass
     print("Camera started. A window titled '%s' should appear (check the Dock / Cmd+Tab if it is hidden). Press q in it to quit." % win)
-    fr = None
+    fr, seq, fps, t_prev = None, 0, 0.0, time.time()
     while True:
         if la.state != "result" or fr is None:   # paused on the grade card: stop consuming frames
-            ok, fr = cap.read()
+            ok, fr, seq = reader.read(seq) if reader else (*cap.read(), 0)
             if not ok:
                 break
             if fr.shape[1] > 960:
                 fr = cv2.resize(fr, (960, int(fr.shape[0] * 960 / fr.shape[1])))
-        cv2.imshow(win, la.process(fr, mirror=isinstance(src, int)))
+        out = la.process(fr, mirror=live_cam)
+        if la.state != "result":
+            now = time.time()
+            fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-3)
+            t_prev = now
+            A.put_text(out, f"{fps:.0f} fps", (out.shape[1] - 110, 30), 0.6, bg=(40, 40, 40))
+        cv2.imshow(win, out)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         if key == ord("r"):
             la.reset()
+            t_prev = time.time()
+    if reader:
+        reader.stop()
     la.close(); cap.release(); cv2.destroyAllWindows()
 
 

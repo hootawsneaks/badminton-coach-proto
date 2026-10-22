@@ -26,6 +26,7 @@ pip install -r requirements.txt
 
 streamlit run app.py             # web UI: "Analyze a video" + "Live webcam" tabs
 python live.py                   # native live window (most reliable for demos); r = redo, q = quit
+python live.py --lite            # lighter pose model: higher frame rate, slightly less precise
 python live.py clip.mp4          # replay a clip in live mode
 python test_analysis.py          # logic tests on synthetic skeletons (no video needed)
 ```
