@@ -6,13 +6,18 @@
 Flow: get ready -> swing -> the screen freezes on your contact frame with a grade card ->
 click REDO (or press r) to try again.
 
-Run standalone:  python live.py            (webcam 0)
-                 python live.py --lite     (faster, lighter pose model -> higher frame rate)
-                 python live.py clip.mp4   (replay a file in real time)
-Keys: r = redo, q = quit.
+Run standalone:  python live.py                    (smash, webcam 0)
+                 python live.py --lite             (faster, lighter pose model -> higher frame rate)
+                 python live.py clip.mp4           (replay a file in real time)
+                 python live.py --drill footwork   (6-point footwork with call-outs, see footwork.py)
+Keys: d = switch drill (smash <-> footwork), r = redo / new session, c = recalibrate the court (footwork), q = quit.
+Every rep is saved to data/history.json so the result cards can compare against your best rep / session.
 """
 from __future__ import annotations
 
+import argparse
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +27,8 @@ import cv2
 import numpy as np
 
 import analysis as A
+import footwork as FW
+from history import History
 
 
 GRADE_COL = {"A": (0, 150, 0), "B": (60, 150, 0), "C": (0, 140, 200), "D": (0, 90, 220), "F": (0, 0, 180)}
@@ -34,8 +41,10 @@ class LiveAnalyzer:
       result - swing captured: the display freezes on the contact frame with the grade card until reset()
     """
 
-    def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5, lite: bool = False):
+    def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5, lite: bool = False,
+                 history: History | None = None):
         self.cfg = cfg or A.Config()
+        self.session = history.start("smash") if history else None
         self.lm = A.make_landmarker(video_mode=True, lite=lite)
         self.buffer_s = buffer_s
         self.arm_s = arm_s
@@ -53,6 +62,10 @@ class LiveAnalyzer:
         self.state = "arming"
         self.state_t = time.time() - self.t0
         self.redo_rect = None
+
+    @property
+    def paused(self):
+        return self.state == "result"
 
     def click(self, x: int, y: int):
         """Mouse click in display coords; returns True if it hit the REDO button."""
@@ -97,6 +110,8 @@ class LiveAnalyzer:
             if rep.ok and rep.contact_idx < len(kps) - int(self.cfg.follow_window_s * fps):
                 self.report = rep
                 self.history.append(rep)
+                if self.session:
+                    self.session.add(rep.score)
                 self.state = "result"
                 self.result_img = self._render_result(rep, kps, mirror)
                 return self.result_img.copy()
@@ -144,6 +159,10 @@ class LiveAnalyzer:
                     (200, 200, 200), 1, cv2.LINE_AA)
 
         y = 150
+        if self.session:
+            cmp = self.session.compare()
+            if cmp:
+                cv2.putText(im, cmp[0], (ox + 24, 130), F, 0.45, (0, 220, 255), 1, cv2.LINE_AA)
         for c in r.checks:
             if c.points is None:
                 continue
@@ -169,6 +188,176 @@ class LiveAnalyzer:
         cv2.putText(im, "REDO  (R)", (bx0 + 30, by1 - 16), F, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(im, "Q to quit", (bx1 + 20, by1 - 16), F, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
         self.redo_rect = (bx0, by0, bx1, by1)
+        return im
+
+    def close(self):
+        self.lm.close()
+
+
+class FootworkLive:
+    """6-point footwork in the live window.
+      calibrate - click the 4 corners of your area (saved to data/court.json, reused next time)
+      drill     - calls a corner, scores each rep; a summary card appears after `reps` reps
+      done      - frozen summary card until reset()
+    """
+
+    def __init__(self, size_m: tuple | None = None, reps: int = 12, calls: bool = True, lite: bool = False,
+                 voice: bool = True, recalibrate: bool = False, history: History | None = None,
+                 cfg: FW.FootworkConfig | None = None):
+        self.lm = A.make_landmarker(video_mode=True, lite=lite)
+        self.size_m, self.reps, self.calls, self.cfg = size_m, reps, calls, cfg or FW.FootworkConfig()
+        self.voice = voice and sys.platform == "darwin" and shutil.which("say") is not None
+        self.hist = history
+        self.court = None if recalibrate else FW.Court.load()
+        if self.court and size_m and (self.court.width_m, self.court.depth_m) != tuple(size_m):
+            self.court = None        # different area size requested -> click the corners again
+        self.clicks: list = []
+        self.t0 = time.time()
+        self._last_ts = -1
+        self.last_frame = None
+        self.button_rect = None
+        self.reset()
+
+    @property
+    def paused(self):
+        return self.state == "done"
+
+    def reset(self):
+        """New session (same court)."""
+        self.state = "calibrate" if self.court is None else "drill"
+        self.drill = FW.FootworkDrill(self.court, self.cfg, self.calls, self.reps) if self.court else None
+        self.session = self.hist.start("footwork", dict(width_m=self.court.width_m, depth_m=self.court.depth_m,
+                                                        calls=self.calls)) if self.hist and self.court else None
+        self.last_rep = None
+        self.flash = ("", 0.0)
+        self.summary_img = None
+        self.button_rect = None
+
+    def recalibrate(self):
+        self.court, self.clicks = None, []
+        self.reset()
+
+    def click(self, x: int, y: int):
+        if self.state == "calibrate" and self.last_frame is not None and len(self.clicks) < 4:
+            self.clicks.append((float(x), float(y)))
+            if len(self.clicks) == 4:
+                h, w = self.last_frame.shape[:2]
+                W, D = self.size_m or (5.2, 6.7)
+                self.court = FW.Court(self.clicks, W, D, (w, h))
+                self.court.save()
+                self.reset()
+            return True
+        r = self.button_rect
+        if self.state == "done" and r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+            self.reset()
+            return True
+        return False
+
+    def _say(self, text):
+        if self.voice:
+            subprocess.Popen(["say", "-r", "250", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def process(self, bgr: np.ndarray, mirror: bool = False, t: float | None = None) -> np.ndarray:
+        """mirror is ignored: the court overlay must line up with the real floor."""
+        if self.state == "done":
+            return self.summary_img.copy()
+        h, w = bgr.shape[:2]
+        self.last_frame = bgr
+        if self.court and tuple(self.court.image_size) not in ((w, h), (0, 0)):
+            self.recalibrate()       # camera resolution changed -> saved corners no longer line up
+        now = (time.time() - self.t0) if t is None else t
+        im = bgr.copy()
+        if self.state == "calibrate":
+            return self._draw_calibration(im)
+
+        ts = max(int(now * 1000), self._last_ts + 1)
+        self._last_ts = ts
+        xy, _ = A.detect(self.lm, bgr, ts)
+        for kind, val in self.drill.update(now, xy):
+            if kind == "call":
+                self._say(val.lower())
+            elif kind == "rep":
+                self.last_rep = val
+                if self.session:
+                    self.session.add(val.score, val.detail())
+            elif kind == "miss":
+                self.flash = (val, now + 2.0)
+                self._say("miss")
+            elif kind == "done":
+                self._say("session complete")
+                self.state = "done"
+                self.summary_img = self._render_summary(im)
+                return self.summary_img.copy()
+
+        d, c = self.drill, self.court
+        active = d.cur["target"] if d.cur and d.state in ("moving", "lunge") else None
+        FW.draw_floor(im, c, active)
+        A.draw_pose(im, xy)
+        FW.draw_minimap(im, c, d, active, height=160)
+        if active and d.calls:
+            A.put_text(im, active, (20, 70), 1.8, (255, 255, 255), FW.ORANGE, 4)
+        elif np.isnan(xy[A.NOSE, 0]) or not FW.feet_visible(xy):
+            A.put_text(im, "Feet not visible - the camera must see your feet in the whole area", (20, 40), 0.65,
+                       bg=(0, 0, 150))
+        else:
+            A.put_text(im, d.hint, (20, 40), 0.8, bg=(60, 60, 60))
+        if self.flash[1] > now:
+            A.put_text(im, self.flash[0][:70], (20, 110), 0.65, bg=(0, 0, 170))
+        A.put_text(im, f"Rep {len(d.results) + (1 if d.cur else 0)}/{self.reps}" if self.reps else
+                   f"Reps {len(d.results)}", (20, h - 50), 0.6, bg=(40, 40, 40))
+        if self.last_rep:
+            r = self.last_rep
+            A.put_text(im, FW.rep_line(r), (20, h - 20), 0.55,
+                       bg=GRADE_COL.get(r.grade, (60, 60, 60)))
+        return im
+
+    def _draw_calibration(self, im):
+        h, w = im.shape[:2]
+        for i, p in enumerate(self.clicks):
+            cv2.circle(im, (int(p[0]), int(p[1])), 7, FW.ORANGE, -1, cv2.LINE_AA)
+            cv2.putText(im, FW.CORNER_PROMPTS[i], (int(p[0]) + 10, int(p[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        FW.ORANGE, 2, cv2.LINE_AA)
+        if len(self.clicks) > 1:
+            cv2.polylines(im, [np.int32(self.clicks)], False, FW.ORANGE, 2, cv2.LINE_AA)
+        W, D = self.size_m or (5.2, 6.7)
+        A.put_text(im, f"SETUP: click the {FW.CORNER_PROMPTS[len(self.clicks)]} corner of your area", (20, 40),
+                   0.75, bg=(150, 80, 0))
+        A.put_text(im, "(left/right as you face the net)  area %.1f x %.1f m - change with --court WxD" % (W, D),
+                   (20, 75), 0.5, bg=(60, 60, 60), thick=1)
+        if min(W, D) < FW.SMALL_AREA_M:
+            A.put_text(im, "Small area: scores lean on reaction, split step and lunge form", (20, 105), 0.5,
+                       bg=(0, 90, 160), thick=1)
+        return im
+
+    def _render_summary(self, last_img):
+        sm = FW.summarize(self.drill.results)
+        im = (last_img * 0.25).astype(np.uint8)
+        h, w = im.shape[:2]
+        F = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(im, sm["grade"], (24, 110), F, 3.6, GRADE_COL.get(sm["grade"], (80, 80, 80)), 10, cv2.LINE_AA)
+        cv2.putText(im, f"{sm['avg']:.0f}/100 avg", (150, 65), F, 1.1, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(im, f"6-point footwork | {sm['n']} reps | best {sm['best']:.0f} | worst {sm['worst']:.0f}",
+                    (150, 100), F, 0.5, (210, 210, 210), 1, cv2.LINE_AA)
+        y = 150
+        lines = self.session.compare() if self.session else []
+        for line in lines:
+            cv2.putText(im, line, (24, y), F, 0.55, (0, 220, 255), 1, cv2.LINE_AA); y += 26
+        y += 8
+        fmt = lambda v: "-" if v is None else f"{v:.2f}s"
+        for line in (f"Avg reaction {fmt(sm['reaction'])}   move {fmt(sm['move'])}   recovery {fmt(sm['recover'])}",
+                     f"Consistency: scores vary +/- {sm['consistency']:.0f}",
+                     f"Weakest corner: {sm['weakest_corner']} ({sm['per_target'][sm['weakest_corner']]:.0f})",
+                     f"Work on: {sm['weakest_metric']} ({sm['metric_avg'].get(sm['weakest_metric'], 0):.0f}/100)"):
+            cv2.putText(im, line, (24, y), F, 0.55, (255, 255, 255), 1, cv2.LINE_AA); y += 26
+        for line in _wrap(sm["tip"], 60)[:3]:
+            cv2.putText(im, line, (24, y), F, 0.5, (0, 200, 255), 1, cv2.LINE_AA); y += 22
+        labels = {k: f"{v:.0f}" for k, v in sm["per_target"].items()}
+        FW.draw_minimap(im, self.court, None, None, height=min(260, h - 140), labels=labels)
+        bx0, by0, bx1, by1 = 24, h - 70, 284, h - 20
+        cv2.rectangle(im, (bx0, by0), (bx1, by1), (0, 140, 255), -1)
+        cv2.putText(im, "NEW SESSION (R)", (bx0 + 18, by1 - 16), F, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(im, "C recalibrate   Q quit", (bx1 + 20, by1 - 16), F, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        self.button_rect = (bx0, by0, bx1, by1)
         return im
 
     def close(self):
@@ -212,20 +401,57 @@ class CameraReader:
         self.ok = False
 
 
+def _court_size(v: str):
+    try:
+        W, D = (float(x) for x in v.lower().replace(" ", "").split("x"))
+        assert W > 0 and D > 0
+        return W, D
+    except Exception:
+        raise argparse.ArgumentTypeError("use WIDTHxDEPTH in metres, e.g. 5.2x6.7 or 3x3")
+
+
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    lite = "--lite" in sys.argv
-    src = args[0] if args else 0
+    ap = argparse.ArgumentParser(description="Live badminton coach")
+    ap.add_argument("source", nargs="?", default=0, help="video file to replay (default: webcam 0)")
+    ap.add_argument("--drill", choices=["smash", "footwork"], default="smash")
+    ap.add_argument("--lite", action="store_true", help="lighter pose model, higher frame rate")
+    ap.add_argument("--court", type=_court_size, default=None,
+                    help="footwork area WIDTHxDEPTH in metres (default 5.2x6.7 = singles half court)")
+    ap.add_argument("--reps", type=int, default=12, help="footwork reps per session (0 = endless)")
+    ap.add_argument("--recalibrate", action="store_true", help="click the court corners again")
+    ap.add_argument("--quiet", action="store_true", help="no spoken call-outs")
+    ap.add_argument("--no-save", action="store_true", help="don't record this session in data/history.json")
+    a = ap.parse_args()
+
+    src = a.source
+    if isinstance(src, str) and src.isdigit():
+        src = int(src)
     cap = cv2.VideoCapture(src)
     if not cap.isOpened():
         sys.exit("Cannot open video source")
     live_cam = isinstance(src, int)
+    file_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if live_cam:
         cap.set(cv2.CAP_PROP_FPS, 60)          # ask for the camera's fastest mode; ignored if unsupported
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     reader = CameraReader(cap) if live_cam else None
-    la = LiveAnalyzer(lite=lite)
-    win = "Badminton smash coach (r = redo, q = quit)"
+    hist = None if a.no_save else History()
+    first = {"recalibrate": a.recalibrate}
+
+    def make(drill):
+        """Build the analyser for a drill. Switching keeps the camera open; each drill keeps its own history."""
+        if drill == "footwork":
+            # a replayed file can't react to call-outs, so it runs in free mode (any corner, no reaction time)
+            an = FootworkLive(a.court, a.reps or None, calls=live_cam, lite=a.lite, voice=not a.quiet,
+                              recalibrate=first.pop("recalibrate", False), history=hist)
+        else:
+            an = LiveAnalyzer(lite=a.lite, history=hist)
+        print(f"Drill: {drill}")
+        return an
+
+    drill = a.drill
+    la = make(drill)
+    win = "Badminton coach (d = switch drill, r = redo / new session, c = recalibrate court, q = quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win, lambda ev, x, y, *_: la.click(x, y) if ev == cv2.EVENT_LBUTTONDOWN else None)
     cv2.resizeWindow(win, 960, 540)
@@ -235,26 +461,39 @@ def main():
     except Exception:
         pass
     print("Camera started. A window titled '%s' should appear (check the Dock / Cmd+Tab if it is hidden). Press q in it to quit." % win)
-    fr, seq, fps, t_prev = None, 0, 0.0, time.time()
+    fr, seq, fps, t_prev, n = None, 0, 0.0, time.time(), 0
     while True:
-        if la.state != "result" or fr is None:   # paused on the grade card: stop consuming frames
+        if not la.paused or fr is None:   # paused on a result card: stop consuming frames
             ok, fr, seq = reader.read(seq) if reader else (*cap.read(), 0)
             if not ok:
                 break
+            n += 1
             if fr.shape[1] > 960:
                 fr = cv2.resize(fr, (960, int(fr.shape[0] * 960 / fr.shape[1])))
-        out = la.process(fr, mirror=live_cam)
-        if la.state != "result":
+        if drill == "footwork":
+            out = la.process(fr, t=None if live_cam else n / file_fps)
+        else:
+            out = la.process(fr, mirror=live_cam)
+        if not la.paused:
             now = time.time()
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-3)
             t_prev = now
-            A.put_text(out, f"{fps:.0f} fps", (out.shape[1] - 110, 30), 0.6, bg=(40, 40, 40))
+            A.put_text(out, f"{fps:.0f} fps", (out.shape[1] - 110, out.shape[0] - 20), 0.6, bg=(40, 40, 40))
+        other = "smash" if drill == "footwork" else "footwork"
+        A.put_text(out, f"D: switch to {other}", (out.shape[1] - 200, out.shape[0] - 55), 0.5, bg=(40, 40, 40), thick=1)
         cv2.imshow(win, out)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
         if key == ord("r"):
             la.reset()
+            t_prev = time.time()
+        if key == ord("c") and drill == "footwork":
+            la.recalibrate()
+        if key == ord("d"):
+            la.close()
+            drill = "smash" if drill == "footwork" else "footwork"
+            la = make(drill)       # the mouse callback looks up `la` at click time, so it follows the switch
             t_prev = time.time()
     if reader:
         reader.stop()

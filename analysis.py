@@ -30,9 +30,11 @@ L_WR, R_WR = 15, 16
 L_HIP, R_HIP = 23, 24
 L_KN, R_KN = 25, 26
 L_AN, R_AN = 27, 28
+L_HEEL, R_HEEL = 29, 30
+L_TOE, R_TOE = 31, 32
 
 SKELETON = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24),
-            (23, 24), (23, 25), (25, 27), (24, 26), (26, 28)]
+            (23, 24), (23, 25), (25, 27), (24, 26), (26, 28), (27, 31), (28, 32)]
 
 
 @dataclass
@@ -241,6 +243,28 @@ def letter(score: float) -> str:
     return "F"
 
 
+def make_check(weight, name, value, pass_line, bench, unit, good_msg, fix_msg, fmt="{:.0f}") -> Check:
+    """Score one metric against its pass line / benchmark (either direction). value None/NaN -> not scored."""
+    if value is None or np.isnan(value):
+        return Check(name, None, "", "na", "Not measurable here.", None, weight)
+    higher = bench > pass_line
+    ok = value >= pass_line if higher else value <= pass_line
+    op = ">=" if higher else "<="
+    return Check(name, float(value), f"{op} {fmt.format(pass_line)}{unit}", "good" if ok else "warn",
+                 f"{fmt.format(value)}{unit} (benchmark {fmt.format(bench)}{unit}) - " + (good_msg if ok else fix_msg),
+                 points(value, pass_line, bench), weight, f"{fmt.format(bench)}{unit}")
+
+
+def score_checks(checks) -> tuple[float, str, str]:
+    """Weighted score over the scored checks -> (score, letter grade, top fix)."""
+    scored = [x for x in checks if x.points is not None]
+    wsum = sum(x.weight for x in scored)
+    score = sum(x.points * x.weight for x in scored) / wsum if wsum else 0.0
+    fixes = sorted((x for x in scored if x.status == "warn"), key=lambda x: -(100 - x.points) * x.weight)
+    top_fix = f"{fixes[0].name}: {fixes[0].message.split(' - ', 1)[-1]}" if fixes else ""
+    return score, letter(score), top_fix
+
+
 # ---------------------------------------------------------------- analysis
 def _arm_idx(arm: str):
     return (R_SH, R_EL, R_WR) if arm == "right" else (L_SH, L_EL, L_WR)
@@ -297,18 +321,8 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
 
     checks: list[Check] = []
 
-    def add(key, name, value, pass_line, bench, unit, good_msg, fix_msg, fmt="{:.0f}"):
-        if value is None or np.isnan(value):
-            checks.append(Check(name, None, "", "na", "Not measurable in this clip.", None, WEIGHTS[key]))
-            return
-        higher = bench > pass_line
-        ok = value >= pass_line if higher else value <= pass_line
-        op = ">=" if higher else "<="
-        v = fmt.format(value)
-        checks.append(Check(name, float(value), f"{op} {fmt.format(pass_line)}{unit}",
-                            "good" if ok else "warn",
-                            f"{v}{unit} (benchmark {fmt.format(bench)}{unit}) - " + (good_msg if ok else fix_msg),
-                            points(value, pass_line, bench), WEIGHTS[key], f"{fmt.format(bench)}{unit}"))
+    def add(key, *a, **kw):
+        checks.append(make_check(WEIGHTS[key], *a, **kw))
 
     # 1. racket-hand speed (the "smash power" proxy)
     add("speed", "Racket-hand speed", float(speed[c]), cfg.min_smash_speed, cfg.bench_smash_speed, " torso/s",
@@ -349,13 +363,9 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
     add("tempo", "Swing tempo", (contact - prep) / fps, cfg.max_swing_time_s, cfg.bench_swing_time_s, " s",
         "quick, explosive acceleration.", "the swing is slow from prep to contact; accelerate late and hard.", "{:.2f}")
 
-    scored = [x for x in checks if x.points is not None]
-    wsum = sum(x.weight for x in scored)
-    score = sum(x.points * x.weight for x in scored) / wsum if wsum else 0.0
-    fixes = sorted((x for x in scored if x.status == "warn"), key=lambda x: -(100 - x.points) * x.weight)
-    top_fix = f"{fixes[0].name}: {fixes[0].message.split(' - ', 1)[-1]}" if fixes else ""
+    score, grade, top_fix = score_checks(checks)
     return Report(True, arm=arm, contact_idx=contact, prep_idx=prep, checks=checks, score=score,
-                  grade=letter(score), top_fix=top_fix, speed=speed, elbow=elbow, fps=fps)
+                  grade=grade, top_fix=top_fix, speed=speed, elbow=elbow, fps=fps)
 
 
 # ---------------------------------------------------------------- drawing

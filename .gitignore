@@ -16,3 +16,6 @@ models/*.task
 *.mkv
 *.webm
 annotated*
+
+# training history + saved court calibration
+data/
