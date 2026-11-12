@@ -97,6 +97,66 @@ def test_live_pause_and_redo():
     assert len(la.history) == 1
 
 
+def make_overhead(fps, slow=1.0, face=0.0, reach=10.0, dur=2.5):
+    """Like make_smash, but the downswing takes `slow` times longer (slow > 1 = softer, drop-like), the
+    head is turned `face` px towards +x (side-on camera) and contact is `reach` px in front of the shoulder."""
+    n = int(dur * fps); base = make_swing(True)[0]
+    k = np.tile(base, (n, 1, 1)).astype(float)
+    sh = base[A.R_SH]
+    k[:, A.NOSE, 0] = 300 + face
+    down = 0.15 * slow
+    for i in range(n):
+        t = i / fps
+        if t < 0.7: y = sh[1] + 20
+        elif t < 1.0: y = sh[1] + 20 - (t - 0.7) / 0.3 * 135
+        elif t < 1.0 + down: y = sh[1] - 115 + (t - 1.0) / down * 230 / slow
+        else: y = sh[1] - 115 + 230 / slow
+        k[i, A.R_WR] = (sh[0] + reach, y); k[i, A.R_EL] = (sh[0] + reach * 0.8, (sh[1] + y) / 2)
+    return k
+
+
+def test_strokes():
+    cfg = A.Config(swing_speed_thresh=1.0)
+    # sweet-spot scoring
+    b = lambda v: A.make_band_check(1, "x", v, 4.5, 6.0, 8.5, 10.0, "", "ok", "low", "high", "{:.1f}")
+    assert b(7).points == 100 and b(6.0).points == 100 and b(8.5).points == 100
+    assert b(4.5).points == 60 and b(10.0).points == 60 and b(4.5).status == b(10).status == "good"
+    assert b(12).status == "warn" and "high" in b(12).message and b(12).points < 60
+    assert b(3).status == "warn" and "low" in b(3).message
+    assert b(float("nan")).status == "na"
+    # every stroke's weights sum to 1 and smash is unchanged by the refactor
+    for s in A.STROKES:
+        assert abs(sum(m.weight for m in A.stroke_metrics(s, cfg)) - 1) < 1e-9, s
+    assert A.analyze(make_smash(30), 30, cfg).score == A.analyze(make_smash(30), 30, cfg, stroke="smash").score
+    try:
+        A.analyze(make_smash(30), 30, cfg, stroke="lob"); raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    # a full-power smash graded as a drop: too fast, big follow-through
+    fast = A.analyze(make_overhead(30, face=25, reach=40), 30, cfg, stroke="drop")
+    ck = {c.name: c for c in fast.checks}
+    assert fast.ok and fast.stroke == "drop"
+    assert ck["Racket-hand speed"].status == "warn" and "too fast" in ck["Racket-hand speed"].message
+    assert ck["Controlled follow-through"].status == "warn"
+    # a soft swing with a checked follow-through is a good drop
+    soft = A.analyze(make_overhead(30, slow=1.4, face=25, reach=40), 30, cfg, stroke="drop")
+    ck = {c.name: c for c in soft.checks}
+    assert ck["Racket-hand speed"].points == 100, ck["Racket-hand speed"].message
+    assert ck["Controlled follow-through"].status == "good"
+    assert ck["Contact in front"].status == "good"
+    assert soft.score > fast.score + 10, (soft.score, fast.score)
+    # contact behind the head: wrong for a drop, fine-ish for a clear; facing unknown -> not scored
+    behind = make_overhead(30, slow=1.4, face=25, reach=-5)
+    d = {c.name: c for c in A.analyze(behind, 30, cfg, stroke="drop").checks}
+    c = {c.name: c for c in A.analyze(behind, 30, cfg, stroke="clear").checks}
+    assert d["Contact in front"].status == "warn" and c["Contact position"].status == "good"
+    flat = {c.name: c for c in A.analyze(make_overhead(30), 30, cfg, stroke="clear").checks}
+    assert flat["Contact position"].status == "na"
+    # the same powerful swing scores better as a clear than as a drop
+    clear = A.analyze(make_overhead(30, face=25, reach=0), 30, cfg, stroke="clear")
+    assert clear.score > fast.score, (clear.score, fast.score)
+
+
 if __name__ == "__main__":
     g, b = run(True), run(False)
     for name, r in (("GOOD", g), ("BAD", b)):
@@ -124,5 +184,6 @@ if __name__ == "__main__":
     assert A.points(140, 165, 140) == 100   # lower-is-better metric (knee angle)
     test_contact_height_at_low_fps()
     test_live_pause_and_redo()
+    test_strokes()
     print("ALL TESTS PASSED")
 

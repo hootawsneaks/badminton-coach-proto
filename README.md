@@ -1,6 +1,6 @@
 # Badminton Form Coach
 
-Computer-vision badminton training. Pick a drill: **smash form** or **6-point footwork**.
+Computer-vision badminton training. Pick a drill: **smash**, **clear** or **drop** form, or **6-point footwork**.
 Works on uploaded video **and** live webcam, and saves every rep so you can track your best rep and best session.
 
 ```
@@ -13,6 +13,7 @@ camera / video -> MediaPipe pose -> swing detection -> joint-angle checks -> coa
 - **Smash benchmark:** 7 metrics, each scored 0-100 against a benchmark (60 = pass line, 100 = benchmark), weighted into a score and an A-F grade.
 - **Tunable thresholds:** all form targets are sliders in the web UI (and fields in `analysis.Config`).
 - **Racket arm:** auto-detected (or set manually).
+- **Clear and drop:** the same live/video flow as the smash, graded against stroke-specific targets. A drop is scored on control: a swing that's too fast, or a big smash-style follow-through, loses points. See [Clear and drop](#clear-and-drop).
 - **6-point footwork:** mark your training area once; the coach calls corners (on screen + spoken), scores every rep on reaction, movement, lunge and recovery, and shows a session card after 12 reps. See [6-point footwork](#6-point-footwork).
 - **Progress tracking:** every rep is saved to `data/history.json`. Result cards show your session average vs your best and last session and flag a new best rep; the web UI has a **Progress** tab with charts.
 
@@ -30,9 +31,10 @@ streamlit run app.py             # web UI: "Analyze a video" + "Live webcam" tab
 python live.py                   # native live window (most reliable for demos); r = redo, q = quit
 python live.py --lite            # lighter pose model: higher frame rate, slightly less precise
 python live.py clip.mp4          # replay a clip in live mode
+python live.py --drill clear                    # or --drill drop
 python live.py --drill footwork                 # 6-point footwork, full singles half court (5.2 x 6.7 m)
 python live.py --drill footwork --court 3x3     # ...in a smaller area (width x depth, metres)
-# in the live window: d = switch drill (smash <-> footwork), r = redo / new session, c = re-mark court, q = quit
+# in the live window: d = next drill (smash -> clear -> drop -> footwork), r = redo / new session, c = re-mark court, q = quit
 python test_footwork.py          # footwork + history tests (no video needed)
 python test_analysis.py          # logic tests on synthetic skeletons (no video needed)
 ```
@@ -55,6 +57,22 @@ The pose model (`models/pose_landmarker_full.task`, ~9 MB) is **not stored in gi
 Grade: A >= 90, B >= 80, C >= 70, D >= 60, else F. "Top fix" = the failed metric costing the most weighted points.
 
 Swing = peak wrist speed. Contact = highest wrist point around that peak. Prep = most-flexed elbow in the 0.7 s before contact.
+
+## Clear and drop
+Same swing detection as the smash; only the targets change (`analysis.stroke_metrics`). Placeholder numbers, as for the smash. Contact position needs a **side-on** camera: it uses the nose to tell which way you face. If that can't be read (e.g. you face the camera), it isn't scored.
+
+| Metric | Clear target | Drop target |
+|---|---|---|
+| Racket-hand speed (torso/s) | pass 6, full marks 11 (20%) | **sweet spot 6-8.5**, pass 4.5-10; too fast is a FIX (20%) |
+| Arm extension at contact | as smash (20%) | as smash (15%) |
+| Contact height (torso) | pass 0.65, full 1.0 (20%) | pass 0.60, full 0.95 (15%) |
+| Contact position, + = in front (torso) | sweet spot -0.05 to 0.20, i.e. above the head (10%) | in front: pass 0.10, full 0.35 (15%) |
+| Follow-through (wrist drop below shoulder) | full: pass 0.0, full 0.4 (10%) | **controlled**: pass <= 0.5, full 0.15 (10%) |
+| Prep elbow ("trophy") | as smash (10%) | as smash; same prep = disguise (10%) |
+| Knee loading | as smash (5%) | as smash (5%) |
+| Swing tempo, prep -> contact | <= 0.5 s, full 0.25 s (5%) | "Disguise": <= 0.5 s, full 0.25 s (10%) |
+
+It grades whether your **form** matches the stroke you chose. With no shuttle tracking, it can't see where the shot actually went.
 
 ## 6-point footwork
 **Setup:** put the camera behind the baseline (or in a high back corner) so it sees **the whole area and your feet**. A phone on a tripod, raised up, works best for a full half court; a laptop webcam can work for a small area. On the first run, click the 4 corners of your area in the window (NET-LEFT, NET-RIGHT, BACK-RIGHT, BACK-LEFT, with left/right as you face the net). The corners are saved to `data/court.json` and reused; press `c` to redo them.
@@ -85,11 +103,11 @@ Recorded clips (upload in the web UI with the drill set to footwork, or `python 
 ## Project layout
 ```
 app.py            Streamlit UI (drill selector, video analysis, live, progress)
-analysis.py       pose extraction, swing detection, smash checks, shared scoring, drawing, video export
+analysis.py       pose extraction, swing detection, smash/clear/drop metrics, shared scoring, drawing, video export
 footwork.py       court calibration, footwork drill state machine, per-rep scoring, overlays
 history.py        session history (best rep / best session / last session)
-live.py           real-time smash + footwork modes in a standalone OpenCV window
-test_analysis.py  smash tests on synthetic skeletons
+live.py           real-time stroke + footwork modes in a standalone OpenCV window
+test_analysis.py  stroke tests on synthetic skeletons
 test_footwork.py  footwork + history tests on a scripted synthetic player
 data/             (git-ignored) history.json and court.json
 requirements.txt

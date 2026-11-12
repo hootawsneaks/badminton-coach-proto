@@ -1,4 +1,4 @@
-"""Badminton overhead-stroke form analysis (clear / smash) from 2D pose.
+"""Badminton overhead-stroke form analysis (smash / clear / drop) from 2D pose.
 
 Pipeline: MediaPipe PoseLandmarker -> smoothed keypoints -> swing detection
 (peak wrist speed) -> joint-angle checks at key phases -> coaching feedback.
@@ -89,6 +89,7 @@ class Report:
     speed: np.ndarray | None = None
     elbow: np.ndarray | None = None
     fps: float = 30.0
+    stroke: str = "smash"
 
     def summary_lines(self):
         return [f"{c.name}: {c.message}" for c in self.checks if c.status == "warn"]
@@ -265,14 +266,125 @@ def score_checks(checks) -> tuple[float, str, str]:
     return score, letter(score), top_fix
 
 
+def make_band_check(weight, name, value, lo_pass, lo_bench, hi_bench, hi_pass, unit, good_msg, low_msg, high_msg,
+                    fmt="{:.0f}") -> Check:
+    """For metrics with a sweet spot (e.g. drop-shot speed): 100 inside [lo_bench, hi_bench], 60 at either pass
+    line, falling off beyond. Too far either way is a FIX."""
+    if value is None or np.isnan(value):
+        return Check(name, None, "", "na", "Not measurable here.", None, weight)
+    if value < lo_bench:
+        pts, msg = points(value, lo_pass, lo_bench), low_msg
+    elif value > hi_bench:
+        pts, msg = points(value, hi_pass, hi_bench), high_msg
+    else:
+        pts, msg = 100.0, good_msg
+    ok = lo_pass <= value <= hi_pass
+    f = fmt.format
+    return Check(name, float(value), f"{f(lo_pass)}-{f(hi_pass)}{unit}", "good" if ok else "warn",
+                 f"{f(value)}{unit} (target {f(lo_bench)}-{f(hi_bench)}{unit}) - " + (good_msg if ok else msg),
+                 pts, weight, f"{f(lo_bench)}-{f(hi_bench)}{unit}")
+
+
+# ---------------------------------------------------------------- strokes
+STROKES = ("smash", "clear", "drop")
+
+
+@dataclass
+class Metric:
+    key: str            # which measured value (see analyze)
+    name: str
+    pass_line: float
+    bench: float
+    weight: float
+    unit: str
+    fmt: str
+    good: str
+    fix: str
+    band: tuple | None = None   # (hi_bench, hi_pass, too_high_msg): scored as a sweet spot, `fix` = too low
+
+
+def stroke_metrics(stroke: str, cfg: Config) -> list[Metric]:
+    """Benchmarks per overhead stroke. Smash reads its numbers from `cfg` (tunable in the web UI);
+    clear and drop are fixed DEMO placeholders - same caveat: tune them against coach-rated clips."""
+    W = WEIGHTS
+    ext = Metric("extension", "Arm extension at contact", cfg.min_elbow_extension_deg, cfg.bench_elbow_extension_deg,
+                 0, " deg", "{:.0f}", "arm well extended.",
+                 "reach up and straighten the arm at contact to hit at the highest point.")
+    prep = Metric("prep", "Preparation elbow height", cfg.min_trophy_elbow_height, cfg.bench_trophy_elbow_height, 0,
+                  " torso", "{:.2f}", "elbow up in a good 'trophy' position.",
+                  "elbow drops below the shoulder in preparation - lift it to build the 'trophy' position.")
+    knee = Metric("knee", "Knee loading", cfg.max_knee_angle_prep, cfg.bench_knee_angle_prep, 0, " deg", "{:.0f}",
+                  "good leg load before the swing.", f"legs are stiff; bend the knees and push up into the {stroke}.")
+    w = lambda m, weight, **kw: Metric(**{**m.__dict__, "weight": weight, **kw})
+    if stroke == "smash":
+        return [
+            Metric("speed", "Racket-hand speed", cfg.min_smash_speed, cfg.bench_smash_speed, W["speed"], " torso/s",
+                   "{:.1f}", "explosive swing.",
+                   "swing faster - snap the forearm (pronation) and whip through the shuttle."),
+            w(ext, W["extension"]),
+            Metric("height", "Contact height", cfg.min_contact_height, cfg.bench_contact_height, W["height"], " torso",
+                   "{:.2f}", "high contact point.",
+                   "hitting too low; get under and slightly behind the shuttle and hit at full reach."),
+            Metric("follow", "Downward follow-through", cfg.min_follow_through, cfg.bench_follow_through, W["follow"],
+                   " torso", "{:.2f}", "racket follows through down past the shoulder.",
+                   "finish the swing down and across your body - don't stop the racket after contact."),
+            w(prep, W["prep"]), w(knee, W["knee"]),
+            Metric("tempo", "Swing tempo", cfg.max_swing_time_s, cfg.bench_swing_time_s, W["tempo"], " s", "{:.2f}",
+                   "quick, explosive acceleration.",
+                   "the swing is slow from prep to contact; accelerate late and hard."),
+        ]
+    if stroke == "clear":
+        return [
+            Metric("speed", "Racket-hand speed", 6.0, 11.0, 0.20, " torso/s", "{:.1f}",
+                   "powerful swing - enough to reach the back line.",
+                   "swing faster - a clear needs a full, fast throwing action to go deep."),
+            w(ext, 0.20),
+            Metric("height", "Contact height", 0.65, 1.00, 0.20, " torso", "{:.2f}", "hit at full reach.",
+                   "contact is low - get behind the shuttle early and hit at the top of your reach."),
+            Metric("front", "Contact position", -0.15, -0.05, 0.10, " torso", "{:.2f}",
+                   "contact above / just in front of the head - right for a clear.",
+                   "contact is behind you - move back faster so you get behind the shuttle.",
+                   band=(0.20, 0.35, "contact is far in front - for a clear let it come above your head "
+                                     "(hitting it out in front sends it down like a smash/drop).")),
+            Metric("follow", "Full follow-through", 0.0, 0.4, 0.10, " torso", "{:.2f}", "full follow-through.",
+                   "don't stop the racket at contact - follow right through so the clear carries."),
+            w(prep, 0.10), w(knee, 0.05),
+            Metric("tempo", "Swing tempo", 0.50, 0.25, 0.05, " s", "{:.2f}", "smooth, quick acceleration.",
+                   "the swing is slow from prep to contact; accelerate through the shuttle."),
+        ]
+    if stroke == "drop":
+        return [
+            Metric("speed", "Racket-hand speed", 4.5, 6.0, 0.20, " torso/s", "{:.1f}", "good touch - controlled pace.",
+                   "too slow and obvious - swing like a smash and slow the racket only at contact.",
+                   band=(8.5, 10.0, "too fast for a drop - ease off at contact so it falls just over the net.")),
+            w(ext, 0.15),
+            Metric("height", "Contact height", 0.60, 0.95, 0.15, " torso", "{:.2f}", "high contact point.",
+                   "contact is low - a drop from low height floats up; hit it high."),
+            Metric("front", "Contact in front", 0.10, 0.35, 0.15, " torso", "{:.2f}",
+                   "taken well in front - the drop travels down steeply.",
+                   "take the drop further in front of your body so it goes down, not up."),
+            Metric("follow", "Controlled follow-through", 0.50, 0.15, 0.10, " torso", "{:.2f}",
+                   "short, controlled finish.",
+                   "the follow-through is big like a smash - check the racket after contact for a softer drop."),
+            w(prep, 0.10, good="same 'trophy' prep as a smash - good disguise."),
+            w(knee, 0.05),
+            Metric("tempo", "Disguise (swing tempo)", 0.50, 0.25, 0.10, " s", "{:.2f}",
+                   "quick prep-to-contact like a smash - hard to read.",
+                   "slow, telegraphed swing - keep your smash preparation and slow down only at contact."),
+        ]
+    raise ValueError(f"unknown stroke {stroke!r}, expected one of {STROKES}")
+
+
 # ---------------------------------------------------------------- analysis
 def _arm_idx(arm: str):
     return (R_SH, R_EL, R_WR) if arm == "right" else (L_SH, L_EL, L_WR)
 
 
-def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | None = None) -> Report:
-    """Analyse one overhead stroke inside a [N,33,2] keypoint sequence (pixel coords, y down)."""
+def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | None = None,
+            stroke: str = "smash") -> Report:
+    """Analyse one overhead stroke (smash / clear / drop) inside a [N,33,2] keypoint sequence (pixel coords, y down)."""
     cfg = cfg or Config()
+    metrics = stroke_metrics(stroke, cfg)
     N = len(kps)
     if N < 8:
         return Report(False, "Not enough frames")
@@ -319,53 +431,38 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
     plo = max(0, contact - win)
     prep = plo + int(np.argmin(elbow[plo:contact])) if contact > plo else plo
 
-    checks: list[Check] = []
-
-    def add(key, *a, **kw):
-        checks.append(make_check(WEIGHTS[key], *a, **kw))
-
-    # 1. racket-hand speed (the "smash power" proxy)
-    add("speed", "Racket-hand speed", float(speed[c]), cfg.min_smash_speed, cfg.bench_smash_speed, " torso/s",
-        "explosive swing.", "swing faster - snap the forearm (pronation) and whip through the shuttle.", "{:.1f}")
-
-    # 2. elbow extension at contact
-    add("extension", "Arm extension at contact", float(elbow[contact]), cfg.min_elbow_extension_deg,
-        cfg.bench_elbow_extension_deg, " deg", "arm well extended.",
-        "reach up and straighten the arm at contact to hit at the highest point.")
-
-    # 3. contact height
-    add("height", "Contact height", float((k[contact, sh_i, 1] - k[contact, wr_i, 1]) / torso),
-        cfg.min_contact_height, cfg.bench_contact_height, " torso", "high contact point.",
-        "hitting too low; get under and slightly behind the shuttle and hit at full reach.", "{:.2f}")
-
-    # 4. follow-through: a smash finishes down and across the body
-    fend = min(N, contact + 1 + int(cfg.follow_window_s * fps))
-    ft = float(np.max(k[contact + 1:fend, wr_i, 1] - k[contact + 1:fend, sh_i, 1]) / torso) \
+    # ---- measured values
+    v = {}
+    v["speed"] = float(speed[c])                                          # racket-hand speed (power proxy)
+    v["extension"] = float(elbow[contact])                                # elbow angle at contact
+    v["height"] = float((k[contact, sh_i, 1] - k[contact, wr_i, 1]) / torso)
+    fend = min(N, contact + 1 + int(cfg.follow_window_s * fps))           # wrist drop below shoulder after contact
+    v["follow"] = float(np.max(k[contact + 1:fend, wr_i, 1] - k[contact + 1:fend, sh_i, 1]) / torso) \
         if fend - contact > 3 else float("nan")
-    add("follow", "Downward follow-through", ft, cfg.min_follow_through, cfg.bench_follow_through, " torso",
-        "racket follows through down past the shoulder.",
-        "finish the swing down and across your body - don't stop the racket after contact.", "{:.2f}")
-
-    # 5. trophy-position elbow height
-    add("prep", "Preparation elbow height", float((k[prep, sh_i, 1] - k[prep, el_i, 1]) / torso),
-        cfg.min_trophy_elbow_height, cfg.bench_trophy_elbow_height, " torso",
-        "elbow up in a good 'trophy' position.",
-        "elbow drops below the shoulder in preparation - lift it to build the 'trophy' position.", "{:.2f}")
-
-    # 6. knee loading (use the more flexed knee in the prep window)
+    v["prep"] = float((k[prep, sh_i, 1] - k[prep, el_i, 1]) / torso)    # trophy-position elbow height
     kn = []
-    for (kk, hh, aa) in ((knee_i, hip_i, ank_i), other):
+    for (kk, hh, aa) in ((knee_i, hip_i, ank_i), other):                  # most-flexed knee in the prep window
         kn.append(np.nanmin([angle(k[t, hh], k[t, kk], k[t, aa]) for t in range(plo, contact + 1)]))
-    add("knee", "Knee loading", float(np.nanmin(kn)), cfg.max_knee_angle_prep, cfg.bench_knee_angle_prep, " deg",
-        "good leg load before the swing.", "legs are stiff; bend the knees and jump/push up into the smash.")
+    v["knee"] = float(np.nanmin(kn))
+    v["tempo"] = (contact - prep) / fps
+    # contact in front (+) / behind (-) the hitting shoulder. "Forward" = the way the face points, from the
+    # nose vs the shoulder centre - only readable from a side-on-ish camera, otherwise not scored.
+    facing = float(np.nanmedian((k[plo:contact + 1, NOSE, 0] - mid_sh[plo:contact + 1, 0]) / torso))
+    v["front"] = float((k[contact, wr_i, 0] - k[contact, sh_i, 0]) * np.sign(facing) / torso) \
+        if abs(facing) >= 0.05 else float("nan")
 
-    # 7. swing tempo: prep -> contact
-    add("tempo", "Swing tempo", (contact - prep) / fps, cfg.max_swing_time_s, cfg.bench_swing_time_s, " s",
-        "quick, explosive acceleration.", "the swing is slow from prep to contact; accelerate late and hard.", "{:.2f}")
+    checks: list[Check] = []
+    for m in metrics:
+        if m.band:
+            hi_bench, hi_pass, high_msg = m.band
+            checks.append(make_band_check(m.weight, m.name, v[m.key], m.pass_line, m.bench, hi_bench, hi_pass, m.unit,
+                                          m.good, m.fix, high_msg, m.fmt))
+        else:
+            checks.append(make_check(m.weight, m.name, v[m.key], m.pass_line, m.bench, m.unit, m.good, m.fix, m.fmt))
 
     score, grade, top_fix = score_checks(checks)
     return Report(True, arm=arm, contact_idx=contact, prep_idx=prep, checks=checks, score=score,
-                  grade=grade, top_fix=top_fix, speed=speed, elbow=elbow, fps=fps)
+                  grade=grade, top_fix=top_fix, speed=speed, elbow=elbow, fps=fps, stroke=stroke)
 
 
 # ---------------------------------------------------------------- drawing
@@ -411,7 +508,7 @@ def annotate_video(frames, kps, rep: Report, fps: float, out_path: str):
             if lab:
                 put_text(im, lab, (20, 40), 1.0, (255, 255, 255), (0, 120, 255) if lab == "CONTACT" else (160, 90, 0), 2)
             if t >= rep.contact_idx:
-                put_text(im, f"Smash grade {rep.grade}  ({rep.score:.0f}/100)", (20, h - 20), 0.9, (255, 255, 255),
+                put_text(im, f"{rep.stroke.title()} grade {rep.grade}  ({rep.score:.0f}/100)", (20, h - 20), 0.9, (255, 255, 255),
                          (0, 130, 0) if rep.score >= 75 else (0, 110, 200) if rep.score >= 50 else (0, 0, 170), 2)
         wr.write(im)
     wr.release()

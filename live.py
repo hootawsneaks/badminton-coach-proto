@@ -1,16 +1,17 @@
 """Real-time analysis: rolling buffer + automatic swing detection.
 
 `LiveAnalyzer.process(bgr)` draws the skeleton and, once a swing is detected, runs the same
-`analyze()` as the offline path and grades the smash against the benchmark in `analysis.Config`.
+`analyze()` as the offline path and grades the stroke (smash / clear / drop) against its benchmark.
 
 Flow: get ready -> swing -> the screen freezes on your contact frame with a grade card ->
 click REDO (or press r) to try again.
 
 Run standalone:  python live.py                    (smash, webcam 0)
+                 python live.py --drill drop       (or clear)
                  python live.py --lite             (faster, lighter pose model -> higher frame rate)
                  python live.py clip.mp4           (replay a file in real time)
                  python live.py --drill footwork   (6-point footwork with call-outs, see footwork.py)
-Keys: d = switch drill (smash <-> footwork), r = redo / new session, c = recalibrate the court (footwork), q = quit.
+Keys: d = next drill (smash -> clear -> drop -> footwork), r = redo / new session, c = recalibrate the court (footwork), q = quit.
 Every rep is saved to data/history.json so the result cards can compare against your best rep / session.
 """
 from __future__ import annotations
@@ -31,20 +32,22 @@ import footwork as FW
 from history import History
 
 
+DRILLS = (*A.STROKES, "footwork")   # order the d key cycles through
 GRADE_COL = {"A": (0, 150, 0), "B": (60, 150, 0), "C": (0, 140, 200), "D": (0, 90, 220), "F": (0, 0, 180)}
 
 
 class LiveAnalyzer:
     """Three states:
       arming - just (re)started; ignore motion for `arm_s` so walking into position isn't scored
-      ready  - watching for a smash
+      ready  - watching for a swing
       result - swing captured: the display freezes on the contact frame with the grade card until reset()
     """
 
     def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5, lite: bool = False,
-                 history: History | None = None):
+                 history: History | None = None, stroke: str = "smash"):
         self.cfg = cfg or A.Config()
-        self.session = history.start("smash") if history else None
+        self.stroke = stroke
+        self.session = history.start(stroke) if history else None
         self.lm = A.make_landmarker(video_mode=True, lite=lite)
         self.buffer_s = buffer_s
         self.arm_s = arm_s
@@ -106,7 +109,7 @@ class LiveAnalyzer:
             ts_arr = np.array([b[0] for b in self.buf])
             fps = (len(ts_arr) - 1) / max(ts_arr[-1] - ts_arr[0], 1e-3)
             kps = np.array([b[1] for b in self.buf])
-            rep = A.analyze(kps, fps, self.cfg)
+            rep = A.analyze(kps, fps, self.cfg, stroke=self.stroke)
             if rep.ok and rep.contact_idx < len(kps) - int(self.cfg.follow_window_s * fps):
                 self.report = rep
                 self.history.append(rep)
@@ -121,7 +124,7 @@ class LiveAnalyzer:
         elif not A.body_in_frame(xy):
             A.put_text(im, A.FRAME_HINT[:78], (20, 40), 0.65, bg=(0, 0, 150))
         else:
-            A.put_text(im, "READY - hit your smash!", (20, 40), 0.9, bg=(0, 120, 0))
+            A.put_text(im, f"READY - hit your {self.stroke}!", (20, 40), 0.9, bg=(0, 120, 0))
         return im
 
     # ------------------------------------------------------------ drawing helpers
@@ -155,7 +158,7 @@ class LiveAnalyzer:
         cv2.putText(im, r.grade, (ox + 24, 110), F, 3.6, col, 10, cv2.LINE_AA)
         cv2.putText(im, f"{r.score:.0f}/100", (ox + 150, 70), F, 1.2, (255, 255, 255), 2, cv2.LINE_AA)
         best = max(x.score for x in self.history)
-        cv2.putText(im, f"Smash  |  attempt {len(self.history)}  |  best {best:.0f}", (ox + 150, 105), F, 0.55,
+        cv2.putText(im, f"{self.stroke.title()}  |  attempt {len(self.history)}  |  best {best:.0f}", (ox + 150, 105), F, 0.55,
                     (200, 200, 200), 1, cv2.LINE_AA)
 
         y = 150
@@ -180,7 +183,7 @@ class LiveAnalyzer:
             for line in _wrap(r.top_fix, 52)[:4]:
                 cv2.putText(im, line, (ox + 24, y), F, 0.5, (255, 255, 255), 1, cv2.LINE_AA); y += 22
         else:
-            cv2.putText(im, "Clean smash - nice form!", (ox + 24, y), F, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
+            cv2.putText(im, f"Clean {self.stroke} - nice form!", (ox + 24, y), F, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
 
         # REDO button
         bx0, by0, bx1, by1 = ox + 24, h - 70, ox + 224, h - 20
@@ -413,7 +416,7 @@ def _court_size(v: str):
 def main():
     ap = argparse.ArgumentParser(description="Live badminton coach")
     ap.add_argument("source", nargs="?", default=0, help="video file to replay (default: webcam 0)")
-    ap.add_argument("--drill", choices=["smash", "footwork"], default="smash")
+    ap.add_argument("--drill", choices=DRILLS, default="smash")
     ap.add_argument("--lite", action="store_true", help="lighter pose model, higher frame rate")
     ap.add_argument("--court", type=_court_size, default=None,
                     help="footwork area WIDTHxDEPTH in metres (default 5.2x6.7 = singles half court)")
@@ -445,7 +448,7 @@ def main():
             an = FootworkLive(a.court, a.reps or None, calls=live_cam, lite=a.lite, voice=not a.quiet,
                               recalibrate=first.pop("recalibrate", False), history=hist)
         else:
-            an = LiveAnalyzer(lite=a.lite, history=hist)
+            an = LiveAnalyzer(lite=a.lite, history=hist, stroke=drill)
         print(f"Drill: {drill}")
         return an
 
@@ -479,8 +482,8 @@ def main():
             fps = 0.9 * fps + 0.1 / max(now - t_prev, 1e-3)
             t_prev = now
             A.put_text(out, f"{fps:.0f} fps", (out.shape[1] - 110, out.shape[0] - 20), 0.6, bg=(40, 40, 40))
-        other = "smash" if drill == "footwork" else "footwork"
-        A.put_text(out, f"D: switch to {other}", (out.shape[1] - 200, out.shape[0] - 55), 0.5, bg=(40, 40, 40), thick=1)
+        nxt = DRILLS[(DRILLS.index(drill) + 1) % len(DRILLS)]
+        A.put_text(out, f"D: switch to {nxt}", (out.shape[1] - 200, out.shape[0] - 55), 0.5, bg=(40, 40, 40), thick=1)
         cv2.imshow(win, out)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -492,7 +495,7 @@ def main():
             la.recalibrate()
         if key == ord("d"):
             la.close()
-            drill = "smash" if drill == "footwork" else "footwork"
+            drill = DRILLS[(DRILLS.index(drill) + 1) % len(DRILLS)]
             la = make(drill)       # the mouse callback looks up `la` at click time, so it follows the switch
             t_prev = time.time()
     if reader:

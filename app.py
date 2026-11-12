@@ -1,4 +1,4 @@
-"""Streamlit demo: badminton coach - smash form + 6-point footwork.   Run:  streamlit run app.py"""
+"""Streamlit demo: badminton coach - smash / clear / drop form + 6-point footwork.   Run:  streamlit run app.py"""
 import hashlib
 import os
 import tempfile
@@ -17,8 +17,9 @@ st.caption("Computer-vision training: pick a drill, then analyse a clip, train l
 # ------------------------------------------------------------ sidebar: drill + thresholds
 d = A.Config()
 with st.sidebar:
-    drill = st.radio("What are you training?", ["Smash", "6-point footwork"])
-    footwork = drill != "Smash"
+    drill = st.radio("What are you training?", ["Smash", "Clear", "Drop", "6-point footwork"])
+    footwork = drill == "6-point footwork"
+    stroke = None if footwork else drill.lower()
     st.divider()
 if footwork:
     with st.sidebar:
@@ -30,7 +31,7 @@ if footwork:
         if min(area_w, area_d) < FW.SMALL_AREA_M:
             st.info("Small area: scores lean on reaction, split step and lunge form more than speed.")
     cfg, arm = A.Config(), None
-else:
+elif stroke == "smash":
     with st.sidebar:
         st.header("Smash pass lines")
         st.caption("Below the pass line = FIX. Full marks at the benchmark (see analysis.Config). "
@@ -43,6 +44,20 @@ else:
             max_knee_angle_prep=st.slider("Max knee angle in prep (deg)", 130, 180, int(d.max_knee_angle_prep)),
             swing_speed_thresh=st.slider("Swing detection sensitivity (lower = more sensitive)", 1.0, 10.0, d.swing_speed_thresh, 0.5),
         )
+else:
+    with st.sidebar:
+        st.header(f"{drill} benchmarks")
+        st.caption("Placeholder targets, not validated norms (see `analysis.stroke_metrics`). The coach grades "
+                   f"whether your form matches a {stroke} - it can't see where the shuttle went.")
+        cfg = A.Config(swing_speed_thresh=st.slider("Swing detection sensitivity (lower = more sensitive)", 1.0,
+                                                    10.0, d.swing_speed_thresh, 0.5))
+        st.dataframe([{"metric": m.name,
+                       "target": (f"{m.fmt.format(m.bench)} to {m.fmt.format(m.band[0])}" if m.band
+                                  else m.fmt.format(m.bench)) + m.unit,
+                       "weight": f"{m.weight:.0%}"} for m in A.stroke_metrics(stroke, A.Config())],
+                     hide_index=True)
+if not footwork:
+    with st.sidebar:
         arm_opt = st.radio("Racket arm", ["Auto-detect", "Right", "Left"])
         arm = None if arm_opt == "Auto-detect" else arm_opt.lower()
 
@@ -63,7 +78,7 @@ def show_report(rep: A.Report):
         st.warning(rep.reason)
         return
     c1, c2 = st.columns(2)
-    c1.metric("Smash grade", rep.grade)
+    c1.metric(f"{rep.stroke.title()} grade", rep.grade)
     c2.metric("Score", f"{rep.score:.0f} / 100")
     st.caption(f"Racket arm: {rep.arm}")
     if rep.top_fix:
@@ -103,8 +118,8 @@ def load_clip(up):
     return key, st.session_state.clip
 
 
-def smash_video(data):
-    rep = A.analyze(data["kps"], data["fps"], cfg, arm)
+def stroke_video(data):
+    rep = A.analyze(data["kps"], data["fps"], cfg, arm, stroke=stroke)
     vid = video_bytes(lambda out: A.annotate_video(data["frames"], data["kps"], rep, data["fps"], out))
     left, right = st.columns([3, 2])
     with left:
@@ -218,14 +233,16 @@ with tab_video:
                  "time. Start each rep standing still in the centre.")
     else:
         st.write("Record a side-on or 45-degree clip (phone is fine) with the whole body in frame, one overhead "
-                 "stroke per clip works best.")
+                 "stroke per clip works best."
+                 + (" For clears and drops, side-on is best: the contact-position check needs to see which way "
+                    "you face." if stroke != "smash" else ""))
     up = st.file_uploader("Upload a clip", type=["mp4", "mov", "avi", "mkv", "webm"])
     if up is not None:
         key, data = load_clip(up)
         if footwork:
             footwork_video(key, data)
         else:
-            smash_video(data)
+            stroke_video(data)
 
 with tab_live:
     if footwork:
@@ -237,8 +254,8 @@ with tab_live:
                     "come back.\n"
                     "- After 12 reps you get a session card comparing against your best session. `r` = new session.")
     else:
-        st.write("Real-time mode: stand so your whole body is visible and smash. The video freezes on your "
-                 "contact frame with your grade; press **Redo** to try again.")
+        st.write(f"Real-time mode: stand so your whole body is visible and play your {stroke}. The video freezes on "
+                 "your contact frame with your grade; press **Redo** to try again.")
         try:
             from streamlit_webrtc import webrtc_streamer
             import av
@@ -249,8 +266,8 @@ with tab_live:
                 return {"la": None}
 
             holder = get_live()
-            if holder["la"] is None or holder["la"].cfg != cfg:
-                holder["la"] = LiveAnalyzer(cfg, history=History())
+            if holder["la"] is None or holder["la"].cfg != cfg or holder["la"].stroke != stroke:
+                holder["la"] = LiveAnalyzer(cfg, history=History(), stroke=stroke)
 
             def cb(frame):
                 img = frame.to_ndarray(format="bgr24")
@@ -271,7 +288,7 @@ with tab_live:
 
 with tab_prog:
     import pandas as pd
-    key_d = "footwork" if footwork else "smash"
+    key_d = "footwork" if footwork else stroke
     hist = History()
     ss = hist.for_drill(key_d)
     st.subheader(f"{drill} progress")
