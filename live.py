@@ -138,21 +138,21 @@ class LiveAnalyzer:
         return cv2.flip(bgr, 1), xy_d
 
     def _render_result(self, r: A.Report, kps: np.ndarray, mirror: bool) -> np.ndarray:
-        """Frozen contact frame + grade card + REDO button."""
-        k = A._smooth(A._interp_nan(kps), A.win_frames(0.1, r.fps))
-        im, xy_d = self._display(self.buf[r.contact_idx][2], k[r.contact_idx], mirror)
-        A.draw_pose(im, xy_d, highlight_arm=r.arm)
-        h, w = im.shape[:2]
-
-        # layout: grade card on the left, contact frame cropped around the player on the right
+        """Grade card + REDO button on the left; on the right, the swing as a 2x2 grid of snapshots
+        (load, trophy, contact, finish), each with the target-form shadow over the player."""
+        frames = [b[2] for b in self.buf]
+        h, w = frames[0].shape[:2]
         pw = min(w // 2, 560)
         cw = w - pw
-        body_x = xy_d[[A.L_SH, A.R_SH, A.L_HIP, A.R_HIP, A.L_WR, A.R_WR, A.L_AN, A.R_AN], 0]
-        px = float(np.nanmean(body_x)) if not np.isnan(body_x).all() else w / 2
-        cx0 = int(np.clip(px - cw / 2, 0, w - cw))
-        canvas = np.full_like(im, 25)
-        canvas[:, pw:] = im[:, cx0:cx0 + cw]
-        im, ox = canvas, 0
+        im, ox = np.full_like(frames[0], 25), 0
+        cols = 2
+        rows = max(1, -(-len(r.phases) // cols))
+        tw, th = cw // cols, (h - 20) // rows
+        for i, tile in enumerate(A.phase_strip(frames, r, (tw, th), mirror)):
+            x, y0 = pw + (i % cols) * tw, (i // cols) * th
+            im[y0:y0 + th, x:x + tw] = tile
+        A.put_text(im, "white shadow = target form   arrows = move this way", (pw + 8, h - 5), 0.4, (255, 255, 255),
+                   (0, 0, 0), 1)
         F = cv2.FONT_HERSHEY_SIMPLEX
         col = GRADE_COL.get(r.grade, (80, 80, 80))
         cv2.putText(im, r.grade, (ox + 24, 110), F, 3.6, col, 10, cv2.LINE_AA)

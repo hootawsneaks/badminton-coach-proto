@@ -13,6 +13,7 @@ camera / video -> MediaPipe pose -> swing detection -> joint-angle checks -> coa
 - **Smash benchmark:** 7 metrics, each scored 0-100 against a benchmark (60 = pass line, 100 = benchmark), weighted into a score and an A-F grade.
 - **Tunable thresholds:** all form targets are sliders in the web UI (and fields in `analysis.Config`).
 - **Racket arm:** auto-detected (or set manually).
+- **Swing breakdown + shadow:** every graded swing is shown as 4 snapshots (**load, trophy, contact, finish**), not just the contact frame. Each one has a translucent white **shadow** of the target form, made from your own skeleton (same limb lengths, same spot) moved to the benchmark, plus yellow arrows from your joints to where they should be and the numbers for that moment (e.g. `elbow 106 -> 170 deg`). Shown in the live result card (2x2 grid) and under the video analysis.
 - **Clear and drop:** the same live/video flow as the smash, graded against stroke-specific targets. A drop is scored on control: a swing that's too fast, or a big smash-style follow-through, loses points. See [Clear and drop](#clear-and-drop).
 - **6-point footwork:** mark your training area once; the coach calls corners (on screen + spoken), scores every rep on reaction, movement, lunge and recovery, and shows a session card after 12 reps. See [6-point footwork](#6-point-footwork).
 - **Progress tracking:** every rep is saved to `data/history.json`. Result cards show your session average vs your best and last session and flag a new best rep; the web UI has a **Progress** tab with charts.

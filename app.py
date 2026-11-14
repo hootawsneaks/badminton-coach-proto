@@ -134,12 +134,12 @@ def stroke_video(data):
         st.subheader("Swing signals")
         st.line_chart(pd.DataFrame({"time (s)": t, "wrist speed (torso/s)": rep.speed,
                                     "elbow angle (deg)": rep.elbow}).set_index("time (s)"))
-        c1, c2 = st.columns(2)
-        k = A._smooth(A._interp_nan(data["kps"]), 5)
-        for col, idx, lab in ((c1, rep.prep_idx, "Preparation"), (c2, rep.contact_idx, "Contact")):
-            im = data["frames"][idx].copy()
-            A.draw_pose(im, k[idx], highlight_arm=rep.arm)
-            col.image(cv2.cvtColor(im, cv2.COLOR_BGR2RGB), caption=f"{lab} (frame {idx})")
+        st.subheader("Swing breakdown")
+        st.caption("Key moments of your swing. Your skeleton is drawn over a white **shadow** of the target form "
+                   "(your own body, moved to the benchmark); yellow arrows show which way to move.")
+        cols = st.columns(len(rep.phases))
+        for col, p, tile in zip(cols, rep.phases, A.phase_strip(data["frames"], rep, (320, 420))):
+            col.image(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB), caption=f"{p.name} - {p.idx / rep.fps:.2f}s")
 
 
 def footwork_video(key, data):

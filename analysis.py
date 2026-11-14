@@ -90,6 +90,7 @@ class Report:
     elbow: np.ndarray | None = None
     fps: float = 30.0
     stroke: str = "smash"
+    phases: list = field(default_factory=list)   # [Phase] key moments of the swing, in time order
 
     def summary_lines(self):
         return [f"{c.name}: {c.message}" for c in self.checks if c.status == "warn"]
@@ -413,8 +414,6 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
         arm = "right" if sp["right"].max() >= sp["left"].max() else "left"
     speed = sp[arm]
     sh_i, el_i, wr_i = _arm_idx(arm)
-    knee_i, hip_i, ank_i = (R_KN, R_HIP, R_AN) if arm == "right" else (L_KN, L_HIP, L_AN)
-    other = (L_KN, L_HIP, L_AN) if arm == "right" else (R_KN, R_HIP, R_AN)
 
     c = int(np.argmax(speed))
     if speed[c] < cfg.swing_speed_thresh:
@@ -437,13 +436,16 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
     v["extension"] = float(elbow[contact])                                # elbow angle at contact
     v["height"] = float((k[contact, sh_i, 1] - k[contact, wr_i, 1]) / torso)
     fend = min(N, contact + 1 + int(cfg.follow_window_s * fps))           # wrist drop below shoulder after contact
-    v["follow"] = float(np.max(k[contact + 1:fend, wr_i, 1] - k[contact + 1:fend, sh_i, 1]) / torso) \
-        if fend - contact > 3 else float("nan")
+    if fend - contact > 3:
+        drop = k[contact + 1:fend, wr_i, 1] - k[contact + 1:fend, sh_i, 1]
+        v["follow"], finish = float(np.max(drop) / torso), contact + 1 + int(np.argmax(drop))
+    else:
+        v["follow"], finish = float("nan"), min(N - 1, contact + win_frames(0.3, fps))
     v["prep"] = float((k[prep, sh_i, 1] - k[prep, el_i, 1]) / torso)    # trophy-position elbow height
-    kn = []
-    for (kk, hh, aa) in ((knee_i, hip_i, ank_i), other):                  # most-flexed knee in the prep window
-        kn.append(np.nanmin([angle(k[t, hh], k[t, kk], k[t, aa]) for t in range(plo, contact + 1)]))
-    v["knee"] = float(np.nanmin(kn))
+    knees = np.array([min((angle(k[t, h], k[t, kk], k[t, a]) for h, kk, a in LEGS), key=lambda x: (np.isnan(x), x))
+                      for t in range(plo, contact + 1)])                  # most-flexed knee in the prep window
+    v["knee"] = float(np.nanmin(knees)) if not np.isnan(knees).all() else float("nan")
+    load = plo + int(np.nanargmin(knees)) if not np.isnan(knees).all() else prep
     v["tempo"] = (contact - prep) / fps
     # contact in front (+) / behind (-) the hitting shoulder. "Forward" = the way the face points, from the
     # nose vs the shoulder centre - only readable from a side-on-ish camera, otherwise not scored.
@@ -461,8 +463,127 @@ def analyze(kps: np.ndarray, fps: float, cfg: Config | None = None, arm: str | N
             checks.append(make_check(m.weight, m.name, v[m.key], m.pass_line, m.bench, m.unit, m.good, m.fix, m.fmt))
 
     score, grade, top_fix = score_checks(checks)
+    face = float(np.sign(facing)) if abs(facing) >= 0.05 else 0.0
+    phases = build_phases(k, {"Load": load, "Trophy": prep, "Contact": contact, "Finish": finish},
+                          metrics, checks, v, arm, torso, face)
     return Report(True, arm=arm, contact_idx=contact, prep_idx=prep, checks=checks, score=score,
-                  grade=grade, top_fix=top_fix, speed=speed, elbow=elbow, fps=fps, stroke=stroke)
+                  grade=grade, top_fix=top_fix, speed=speed, elbow=elbow, fps=fps, stroke=stroke, phases=phases)
+
+
+# ---------------------------------------------------------------- phases + "shadow" (target pose)
+# One swing is shown as several snapshots. Each snapshot gets a shadow: the player's own skeleton
+# (same limb lengths, same spot) bent into the benchmark position for the metrics judged at that moment.
+LEGS = ((L_HIP, L_KN, L_AN), (R_HIP, R_KN, R_AN))
+PHASE_METRICS = {"Load": ("knee",), "Trophy": ("prep",), "Contact": ("extension", "height", "front"),
+                 "Finish": ("follow",)}
+PHASE_HELP = {"Load": "legs bent, ready to push", "Trophy": "elbow up, racket back",
+              "Contact": "hit at full reach", "Finish": "racket follows through"}
+SHORT = {"knee": "knee", "prep": "elbow ht", "extension": "elbow", "height": "reach", "front": "in front",
+         "follow": "follow"}
+
+
+@dataclass
+class Phase:
+    name: str
+    idx: int               # frame index in the analysed sequence
+    status: str            # "good" | "warn" | "na"
+    notes: list            # short lines, one per metric judged at this moment
+    pose: np.ndarray       # (33,2) the player's (smoothed) pose at idx
+    ghost: np.ndarray      # (33,2) the target pose ("shadow"), same pixel coords
+
+
+def metric_target(m: Metric, value) -> float | None:
+    """Benchmark value to aim for; the player's own value if they already beat it. None = not measurable."""
+    if value is None or np.isnan(value):
+        return None
+    if m.band:
+        return float(np.clip(value, m.bench, m.band[0]))
+    return float(max(value, m.bench) if m.bench > m.pass_line else min(value, m.bench))
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else np.array([0.0, -1.0])
+
+
+def _rot(v, a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+
+
+def _two_link(root, target, l1, l2, hint):
+    """Place a 2-segment limb root -> joint -> end reaching for target; the joint bends to the side nearest `hint`."""
+    d = np.asarray(target, float) - root
+    u = _unit(d)
+    dist = float(np.clip(np.linalg.norm(d), abs(l1 - l2) + 1e-3, l1 + l2 - 1e-3))
+    a = np.arccos(np.clip((l1 ** 2 + dist ** 2 - l2 ** 2) / (2 * l1 * dist), -1, 1))
+    joint = min((root + l1 * _rot(u, s * a) for s in (1, -1)), key=lambda j: np.linalg.norm(j - hint))
+    return joint, root + u * dist
+
+
+def ghost_pose(xy, phase: str, tgt: dict, arm: str, torso: float, face: float) -> np.ndarray:
+    """Target pose for one phase. `tgt` holds only the metrics that need changing (key -> target value)."""
+    g = xy.copy()
+    if np.isnan(xy[[L_SH, R_SH, L_HIP, R_HIP]]).any():
+        return g
+    sh_i, el_i, wr_i = _arm_idx(arm)
+    sh, el, wr = xy[sh_i], xy[el_i], xy[wr_i]
+    l1, l2 = np.linalg.norm(el - sh), np.linalg.norm(wr - el)
+    arm_ok = not np.isnan([l1, l2]).any() and l1 > 1 and l2 > 1
+    if phase == "Load" and "knee" in tgt:
+        legs = [leg for leg in LEGS if not np.isnan(xy[list(leg)]).any()]
+        if not legs:
+            return g
+        K, deltas = np.radians(tgt["knee"]), []
+        for h, kn, an in legs:            # keep the feet planted; lower the hips until the knees reach the target
+            a, b = np.linalg.norm(xy[h] - xy[kn]), np.linalg.norm(xy[kn] - xy[an])
+            d = np.sqrt(a * a + b * b - 2 * a * b * np.cos(K))
+            deltas.append(xy[an] + _unit(xy[h] - xy[an]) * d - xy[h])
+        feet = {L_KN, R_KN, L_AN, R_AN, L_HEEL, R_HEEL, L_TOE, R_TOE}
+        g[[i for i in range(33) if i not in feet]] += np.mean(deltas, axis=0)
+        for h, kn, an in legs:
+            a, b = np.linalg.norm(xy[h] - xy[kn]), np.linalg.norm(xy[kn] - xy[an])
+            hint = xy[kn] + np.array([(face or 1) * 0.3 * torso, 0])   # knees bend forward
+            g[kn], _ = _two_link(g[h], xy[an], a, b, hint)
+    elif phase == "Trophy" and "prep" in tgt and arm_ok:
+        dy = float(np.clip(-tgt["prep"] * torso, -0.98 * l1, 0.98 * l1))
+        side = np.sign(el[0] - sh[0]) or -(face or 1)
+        new_el = sh + np.array([side * np.sqrt(l1 * l1 - dy * dy), dy])
+        u0, u1 = el - sh, new_el - sh                                    # swing the whole arm up, forearm rides along
+        turn = np.arctan2(u0[0] * u1[1] - u0[1] * u1[0], u0 @ u1)
+        g[el_i], g[wr_i] = new_el, new_el + _rot(wr - el, turn)
+    elif phase == "Contact" and tgt and arm_ok:
+        E = np.radians(tgt.get("extension", angle(sh, el, wr)))
+        r = np.sqrt(l1 * l1 + l2 * l2 - 2 * l1 * l2 * np.cos(E))         # shoulder-to-wrist reach at that elbow angle
+        dy = -tgt["height"] * torso if "height" in tgt else wr[1] - sh[1]
+        dx = tgt["front"] * torso * face if "front" in tgt and face else wr[0] - sh[0]
+        g[el_i], g[wr_i] = _two_link(sh, sh + r * _unit(np.array([dx, dy])), l1, l2, el)
+    elif phase == "Finish" and "follow" in tgt and arm_ok:
+        g[el_i], g[wr_i] = _two_link(sh, (wr[0], sh[1] + tgt["follow"] * torso), l1, l2, el)
+    return g
+
+
+def build_phases(k, idx: dict, metrics, checks, v: dict, arm, torso, face) -> list:
+    by_key = {m.key: (m, c) for m, c in zip(metrics, checks)}
+    out = []
+    for name, keys in PHASE_METRICS.items():
+        t, tgt, notes, stats = idx[name], {}, [], []
+        for key in keys:
+            if key not in by_key or by_key[key][1].points is None:
+                continue
+            m, c = by_key[key]
+            target = metric_target(m, v[key])
+            f = m.fmt.format
+            unit = m.unit.replace(" torso", "")
+            if target is not None and abs(target - v[key]) > 1e-9:
+                tgt[key] = target
+            stats.append(c.status)
+            notes.append(f"{SHORT[key]} {f(v[key])} ok" if c.status == "good" and key not in tgt else
+                         f"{SHORT[key]} {f(v[key])} -> {f(target)}{unit}")
+        status = "warn" if "warn" in stats else "good" if stats else "na"
+        out.append(Phase(name, t, status, notes or ["not scored here"], k[t].copy(),
+                         ghost_pose(k[t], name, tgt, arm, torso, face)))
+    return sorted(out, key=lambda p: p.idx)
 
 
 # ---------------------------------------------------------------- drawing
@@ -480,6 +601,73 @@ def draw_pose(img, xy, color=(80, 220, 120), highlight_arm: str | None = None, t
         if not np.isnan(xy[i]).any():
             cv2.circle(img, tuple(int(v) for v in xy[i]), 5, (255, 255, 255), -1, cv2.LINE_AA)
     return img
+
+
+GHOST_COL = (255, 255, 255)
+ARROW_COL = (0, 230, 255)
+STATUS_COL = {"good": (0, 140, 0), "warn": (0, 110, 230), "na": (90, 90, 90)}
+
+
+def draw_ghost(img, ghost, pose=None, scale_px: float = 0.0, alpha=0.55, thick=9):
+    """Translucent 'shadow' skeleton of the target pose, plus arrows from the player's joints to where they
+    should be (only for joints that are noticeably off)."""
+    if np.isnan(ghost[[L_SH, R_SH]]).any():
+        return img
+    ov = img.copy()
+    for a, b in SKELETON:
+        if not (np.isnan(ghost[a]).any() or np.isnan(ghost[b]).any()):
+            cv2.line(ov, tuple(int(v) for v in ghost[a]), tuple(int(v) for v in ghost[b]), GHOST_COL, thick, cv2.LINE_AA)
+    cv2.addWeighted(ov, alpha, img, 1 - alpha, 0, img)
+    if pose is not None:
+        for i in (L_EL, R_EL, L_WR, R_WR, L_HIP, R_HIP, L_KN, R_KN):
+            p, q = pose[i], ghost[i]
+            if not (np.isnan(p).any() or np.isnan(q).any()) and np.linalg.norm(q - p) > max(6.0, scale_px):
+                cv2.arrowedLine(img, tuple(int(v) for v in p), tuple(int(v) for v in q), ARROW_COL, 2, cv2.LINE_AA,
+                                tipLength=0.3)
+    return img
+
+
+def phase_tile(frame, ph, n: int, arm: str, size: tuple, mirror: bool = False) -> np.ndarray:
+    """One snapshot of the swing: the frame cropped around the player, their skeleton over the target shadow,
+    a numbered header and the per-metric notes for that moment."""
+    tw, th = size
+    pts = np.vstack([ph.pose, ph.ghost])
+    pts = pts[~np.isnan(pts).any(axis=1)]
+    H, W = frame.shape[:2]
+    if len(pts):
+        (x0, y0), (x1, y1) = pts.min(0), pts.max(0)
+    else:
+        x0, y0, x1, y1 = 0, 0, W, H
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    bw, bh = (x1 - x0) * 1.3 + 20, (y1 - y0) * 1.25 + 60       # room for the header / notes
+    s = min(tw / bw, th / bh)
+    M = np.float32([[s, 0, tw / 2 - cx * s], [0, s, th / 2 - cy * s + 8]])
+    im = cv2.warpAffine(frame, M, (tw, th), borderValue=(25, 25, 25))
+    tf = lambda p: np.c_[p[:, 0] * s + M[0, 2], p[:, 1] * s + M[1, 2]]
+    pose, ghost = tf(ph.pose), tf(ph.ghost)
+    if mirror:
+        im = cv2.flip(im, 1)
+        pose[:, 0], ghost[:, 0] = tw - 1 - pose[:, 0], tw - 1 - ghost[:, 0]
+    torso = np.linalg.norm((pose[L_SH] + pose[R_SH]) / 2 - (pose[L_HIP] + pose[R_HIP]) / 2)
+    draw_ghost(im, ghost, pose, 0.08 * torso if not np.isnan(torso) else 0, thick=max(5, int(tw / 30)))
+    draw_pose(im, pose, highlight_arm=arm, thick=2)
+    cv2.rectangle(im, (0, 0), (tw, 24), STATUS_COL[ph.status], -1)
+    cv2.putText(im, f"{n}. {ph.name.upper()}", (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    hint = PHASE_HELP.get(ph.name, "")
+    (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+    if hw < tw - 110:
+        cv2.putText(im, hint, (tw - hw - 6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (230, 230, 230), 1, cv2.LINE_AA)
+    y = th - 8 - 18 * (len(ph.notes) - 1)
+    for line in ph.notes:
+        put_text(im, line, (6, y), 0.42, (255, 255, 255), (40, 40, 40), 1)
+        y += 18
+    cv2.rectangle(im, (0, 0), (tw - 1, th - 1), (60, 60, 60), 1)
+    return im
+
+
+def phase_strip(frames, rep: Report, size=(240, 270), mirror=False) -> list:
+    """Tiles for every phase of `rep`; `frames` is indexable by frame index."""
+    return [phase_tile(frames[p.idx], p, i + 1, rep.arm, size, mirror) for i, p in enumerate(rep.phases)]
 
 
 def put_text(img, text, org, scale=0.7, color=(255, 255, 255), bg=(0, 0, 0), thick=2):

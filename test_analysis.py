@@ -157,6 +157,34 @@ def test_strokes():
     assert clear.score > fast.score, (clear.score, fast.score)
 
 
+def test_phases_and_shadow():
+    """The swing is broken into ordered snapshots; a shadow (target pose) is built where the form misses."""
+    g, b = run(True), run(False)
+    for r in (g, b):
+        assert [p.name for p in r.phases] and len(r.phases) == 4
+        assert [p.idx for p in r.phases] == sorted(p.idx for p in r.phases)
+        assert {p.name for p in r.phases} == {"Load", "Trophy", "Contact", "Finish"}
+    ph = {p.name: p for p in b.phases}
+    sh, el, wr = A._arm_idx(b.arm)
+    c = ph["Contact"]
+    assert c.status == "warn"
+    assert abs(A.angle(c.ghost[sh], c.ghost[el], c.ghost[wr]) - 170) < 1.5     # straightened to the benchmark
+    for i, j in ((sh, el), (el, wr)):                                           # limb lengths kept
+        assert abs(np.linalg.norm(c.ghost[i] - c.ghost[j]) - np.linalg.norm(c.pose[i] - c.pose[j])) < 1e-6
+    ld = ph["Load"]
+    knee = min(A.angle(ld.ghost[h], ld.ghost[k], ld.ghost[a]) for h, k, a in A.LEGS)
+    assert abs(knee - 140) < 1.5, knee
+    tr = ph["Trophy"]
+    assert (tr.ghost[sh, 1] - tr.ghost[el, 1]) > (tr.pose[sh, 1] - tr.pose[el, 1])  # elbow lifted
+    # a phase that is already at the benchmark keeps the player's own pose
+    for p in g.phases:
+        if all("ok" in n for n in p.notes):
+            assert np.allclose(p.ghost, p.pose, equal_nan=True)
+    frames = [np.zeros((480, 640, 3), np.uint8)] * len(make_swing(False))
+    tiles = A.phase_strip(frames, b, (240, 270), mirror=True)
+    assert len(tiles) == 4 and tiles[0].shape == (270, 240, 3)
+
+
 if __name__ == "__main__":
     g, b = run(True), run(False)
     for name, r in (("GOOD", g), ("BAD", b)):
@@ -185,5 +213,6 @@ if __name__ == "__main__":
     test_contact_height_at_low_fps()
     test_live_pause_and_redo()
     test_strokes()
+    test_phases_and_shadow()
     print("ALL TESTS PASSED")
 
