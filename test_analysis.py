@@ -85,13 +85,22 @@ def test_live_pause_and_redo():
     for _ in range(20):          # standing still during arming
         step(0)
     assert la.state == "ready", la.state
+    assert not np.array_equal(step(0), step(0)), "the ideal-stroke demo should be animating while you wait"
     for i in range(80):
         step(i)
         if la.state == "result":
             break
     assert la.state == "result" and la.report is not None
-    frozen = step(0)
-    assert np.array_equal(frozen, step(10)), "display should stay frozen on the result card"
+    rep = la.report
+    shots = [step(0) for _ in range(90)]          # 3 s on the result screen: no new swing is analysed...
+    assert la.state == "result" and la.report is rep and len(la.history) == 1
+    assert any(not np.array_equal(shots[0], s) for s in shots), "...but the replay should be playing"
+    assert all(np.array_equal(shots[0][:, :la.res["pw"]], s[:, :la.res["pw"]]) for s in shots), "grade card is static"
+    px0, py0, px1, py1 = la.panel_rect           # clicking the replay cycles the views
+    assert la.click((px0 + px1) // 2, (py0 + py1) // 2) and la.VIEWS[la.view] == "snapshots"
+    assert np.array_equal(step(0), step(0)), "the snapshot view is a still"
+    la.next_view(); assert la.VIEWS[la.view] == "key moments"
+    la.next_view(); assert la.VIEWS[la.view] == "replay"
     x0, y0, x1, y1 = la.redo_rect
     assert la.click((x0 + x1) // 2, (y0 + y1) // 2) and la.state == "arming"
     assert len(la.history) == 1
@@ -185,6 +194,65 @@ def test_phases_and_shadow():
     assert len(tiles) == 4 and tiles[0].shape == (270, 240, 3)
 
 
+
+def test_whole_swing_snapshots_and_track():
+    """The swing is judged on snapshots spread across the whole movement, not one frame; the shadow
+    follows the player on every frame of the swing."""
+    cfg = A.Config(swing_speed_thresh=1.0)
+    g, b = A.analyze(make_smash(30), 30, cfg), run(False)
+    for r in (g, b):
+        tr = r.track
+        idx = [p.idx for p in r.snapshots]
+        assert 4 <= len(idx) <= A.N_SNAPSHOTS and idx == sorted(set(idx))
+        assert set(tr.keys.values()) <= set(idx), "every key moment is one of the snapshots"
+        assert idx[0] == tr.start and idx[-1] == tr.end
+        assert len(idx) == A.N_SNAPSHOTS and np.diff(idx).max() <= 2 * (tr.end - tr.start) / (A.N_SNAPSHOTS - 1)
+        # a shadow on every frame of the swing, none outside it
+        assert not np.isnan(tr.ghost[tr.start:tr.end + 1, A.L_SH]).any()
+        assert np.isnan(tr.ghost[:tr.start]).all() and np.isnan(tr.ghost[tr.end + 1:]).all()
+        sh, el, wr = A._arm_idx(r.arm)
+        for t in range(tr.start, tr.end + 1):   # limb lengths kept on every frame
+            for i, j in ((sh, el), (el, wr)):
+                assert abs(np.linalg.norm(tr.ghost[t, i] - tr.ghost[t, j]) - np.linalg.norm(tr.pose[t, i] - tr.pose[t, j])) < 1e-6
+        path = next(c for c in r.checks if c.name == "Whole-swing match")
+        assert abs(path.value - np.mean([p.match for p in r.snapshots])) < 1e-9
+    gp = next(c for c in g.checks if c.name == "Whole-swing match")
+    bp = next(c for c in b.checks if c.name == "Whole-swing match")
+    assert gp.status == "good" and bp.status == "warn" and gp.value > bp.value + 20, (gp.value, bp.value)
+    # the bent-arm contact: the shadow straightens the arm at contact, and the frames just before are
+    # pulled the same way (less strongly) - the target moves smoothly instead of jumping at one frame
+    tr, c = b.track, b.contact_idx
+    sh, el, wr = A._arm_idx(b.arm)
+    ang = lambda p: A.angle(p[sh], p[el], p[wr])
+    assert abs(ang(tr.ghost[c]) - 170) < 1.5
+    assert ang(tr.pose[c - 1]) < ang(tr.ghost[c - 1]) < 170
+    assert next(p for p in b.snapshots if p.idx == c).status == "warn"
+    # drawing
+    frames = [np.zeros((480, 640, 3), np.uint8)] * len(tr.pose)
+    assert all(t.shape == (220, 160, 3) for t in A.snapshot_strip(frames, b, (160, 220)))
+    a, z = A.replay_span(b)
+    assert a < tr.start and z >= tr.end
+    assert A.replay_tile(frames, b, c, (400, 300), mirror=True).shape == (300, 400, 3)
+
+
+def test_ideal_demo():
+    """The ideal-stroke demo keeps its limb lengths and goes through the stroke's key moments."""
+    for st in A.STROKES:
+        seen = set()
+        for u in np.linspace(0, 1, 60, endpoint=False):
+            p, tip, name = A.demo_pose(u, st)
+            seen.add(name)
+            assert abs(np.linalg.norm(p[A.R_EL] - p[A.R_SH]) - A._UA) < 1e-9
+            assert abs(np.linalg.norm(p[A.R_WR] - p[A.R_EL]) - A._FA) < 1e-9
+            assert abs(np.linalg.norm(p[A.R_KN] - p[A.R_AN]) - A._SH) < 1e-6
+        assert seen == set(A.DEMO_KEYS), (st, seen)
+        p = A.demo_pose(A.DEMO_T[A.DEMO_KEYS.index("Contact")], st)[0]
+        assert A.angle(p[A.R_SH], p[A.R_EL], p[A.R_WR]) > 165 and p[A.R_WR, 1] > 0.9   # straight arm, high
+    fin = {st: A.demo_pose(A.DEMO_T[-1], st)[0][A.R_WR, 1] for st in A.STROKES}
+    assert fin["smash"] < fin["clear"] < fin["drop"], fin    # smash follows through furthest, drop least
+    assert A.demo_strip("drop").shape == (230, 150 * 5, 3)
+
+
 if __name__ == "__main__":
     g, b = run(True), run(False)
     for name, r in (("GOOD", g), ("BAD", b)):
@@ -214,5 +282,7 @@ if __name__ == "__main__":
     test_live_pause_and_redo()
     test_strokes()
     test_phases_and_shadow()
+    test_whole_swing_snapshots_and_track()
+    test_ideal_demo()
     print("ALL TESTS PASSED")
 

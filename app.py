@@ -134,9 +134,18 @@ def stroke_video(data):
         st.subheader("Swing signals")
         st.line_chart(pd.DataFrame({"time (s)": t, "wrist speed (torso/s)": rep.speed,
                                     "elbow angle (deg)": rep.elbow}).set_index("time (s)"))
-        st.subheader("Swing breakdown")
-        st.caption("Key moments of your swing. Your skeleton is drawn over a white **shadow** of the target form "
-                   "(your own body, moved to the benchmark); yellow arrows show which way to move.")
+        st.subheader("Whole swing, snapshot by snapshot")
+        st.caption(f"{len(rep.snapshots)} moments spread from your load to your finish, each compared with the target "
+                   "path (the white **shadow**: your own body, moved to where the benchmark wants it at that "
+                   "moment). Their average is the *Whole-swing match* score. In the video above, the shadow "
+                   "follows you through the whole swing.")
+        tiles = A.snapshot_strip(data["frames"], rep, (240, 330))
+        for row in range(0, len(tiles), 4):
+            cols = st.columns(4)
+            for col, p, tile in zip(cols, rep.snapshots[row:row + 4], tiles[row:row + 4]):
+                col.image(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB), caption=f"{p.name} - {p.idx / rep.fps:.2f}s")
+        st.subheader("Key moments")
+        st.caption("The benchmark checks for each key moment. Yellow arrows show which way to move.")
         cols = st.columns(len(rep.phases))
         for col, p, tile in zip(cols, rep.phases, A.phase_strip(data["frames"], rep, (320, 420))):
             col.image(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB), caption=f"{p.name} - {p.idx / rep.fps:.2f}s")
@@ -236,6 +245,12 @@ with tab_video:
                  "stroke per clip works best."
                  + (" For clears and drops, side-on is best: the contact-position check needs to see which way "
                     "you face." if stroke != "smash" else ""))
+    if not footwork:
+        import cv2
+        with st.expander(f"The ideal {stroke} - what you're aiming for", expanded=False):
+            st.image(cv2.cvtColor(A.demo_strip(stroke, arm=arm or "right"), cv2.COLOR_BGR2RGB),
+                     caption="Target movement, key moment by key moment (the racket is drawn in yellow). "
+                             "Live mode shows this looping in the corner while you get ready.")
     up = st.file_uploader("Upload a clip", type=["mp4", "mov", "avi", "mkv", "webm"])
     if up is not None:
         key, data = load_clip(up)
@@ -254,8 +269,10 @@ with tab_live:
                     "come back.\n"
                     "- After 12 reps you get a session card comparing against your best session. `r` = new session.")
     else:
-        st.write(f"Real-time mode: stand so your whole body is visible and play your {stroke}. The video freezes on "
-                 "your contact frame with your grade; press **Redo** to try again.")
+        st.write(f"Real-time mode: stand so your whole body is visible and play your {stroke} (the ideal {stroke} "
+                 "loops in the top-right corner). After the swing you get your grade and a slow-motion replay with "
+                 "the target shadow following you; click the replay to see the 8 snapshots, then the key moments. "
+                 "Press **Redo** to try again.")
         try:
             from streamlit_webrtc import webrtc_streamer
             import av

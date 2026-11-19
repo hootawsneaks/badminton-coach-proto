@@ -3,15 +3,17 @@
 `LiveAnalyzer.process(bgr)` draws the skeleton and, once a swing is detected, runs the same
 `analyze()` as the offline path and grades the stroke (smash / clear / drop) against its benchmark.
 
-Flow: get ready -> swing -> the screen freezes on your contact frame with a grade card ->
-click REDO (or press r) to try again.
+Flow: get ready (an "ideal stroke" shadow loops in the corner) -> swing -> the result card shows your
+grade next to a slow-motion replay of the swing with the target shadow following you; v (or a click on
+the replay) switches to 8 snapshots across the swing, then the 4 key moments -> click REDO (or press r).
 
 Run standalone:  python live.py                    (smash, webcam 0)
                  python live.py --drill drop       (or clear)
                  python live.py --lite             (faster, lighter pose model -> higher frame rate)
                  python live.py clip.mp4           (replay a file in real time)
                  python live.py --drill footwork   (6-point footwork with call-outs, see footwork.py)
-Keys: d = next drill (smash -> clear -> drop -> footwork), r = redo / new session, c = recalibrate the court (footwork), q = quit.
+Keys: d = next drill (smash -> clear -> drop -> footwork), r = redo / new session, v = result view,
+      c = recalibrate the court (footwork), q = quit.
 Every rep is saved to data/history.json so the result cards can compare against your best rep / session.
 """
 from __future__ import annotations
@@ -40,8 +42,12 @@ class LiveAnalyzer:
     """Three states:
       arming - just (re)started; ignore motion for `arm_s` so walking into position isn't scored
       ready  - watching for a swing
-      result - swing captured: the display freezes on the contact frame with the grade card until reset()
+      result - swing captured: grade card + replay / snapshots / key moments until reset()
     """
+    VIEWS = ("replay", "snapshots", "key moments")
+    REPLAY_SPEED = 0.4       # slow motion
+    KEY_HOLD_S = 0.7         # the replay pauses this long on each key moment
+    DEMO_LOOP_S = 2.6        # one loop of the ideal-stroke demo
 
     def __init__(self, cfg: A.Config | None = None, buffer_s: float = 2.5, arm_s: float = 1.5, lite: bool = False,
                  history: History | None = None, stroke: str = "smash"):
@@ -55,16 +61,19 @@ class LiveAnalyzer:
         self.t0 = time.time()
         self.history: list[A.Report] = []
         self.redo_rect = None        # (x0, y0, x1, y1) of the on-screen REDO button, display coords
+        self.panel_rect = None       # the right-hand result panel (click = next view)
+        self.view = 0
         self.reset()
 
     def reset(self):
         """Start a new attempt (the 'redo' action)."""
         self.buf = deque()           # (t_seconds, kps[33,2], raw frame)
         self.report: A.Report | None = None
-        self.result_img = None
         self.state = "arming"
         self.state_t = time.time() - self.t0
         self.redo_rect = None
+        self.panel_rect = None
+        self.res = None              # cached result drawing (left card, static views, replay playlist)
 
     @property
     def paused(self):
@@ -76,14 +85,21 @@ class LiveAnalyzer:
         if self.state == "result" and r and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
             self.reset()
             return True
+        p = self.panel_rect
+        if self.state == "result" and p and p[0] <= x <= p[2] and p[1] <= y <= p[3]:
+            self.next_view()
+            return True
         return False
+
+    def next_view(self):
+        self.view = (self.view + 1) % len(self.VIEWS)
 
     def process(self, bgr: np.ndarray, mirror: bool = False) -> np.ndarray:
         """Analyse a raw (un-flipped) camera frame. If mirror=True the returned display image is
         flipped like a mirror, but pose detection still runs on the raw frame so that left/right
         arm labels stay anatomically correct."""
         if self.state == "result":
-            return self.result_img.copy()   # paused: keep showing the grade until redo
+            return self._compose_result()   # paused on the result: the replay keeps playing until redo
 
         h, w = bgr.shape[:2]
         now = time.time() - self.t0
@@ -96,6 +112,7 @@ class LiveAnalyzer:
 
         im, xy_d = self._display(bgr, xy, mirror)
         A.draw_pose(im, xy_d)
+        self._draw_demo(im, now)
 
         if self.state == "arming":
             left = self.arm_s - (now - self.state_t)
@@ -116,8 +133,8 @@ class LiveAnalyzer:
                 if self.session:
                     self.session.add(rep.score)
                 self.state = "result"
-                self.result_img = self._render_result(rep, kps, mirror)
-                return self.result_img.copy()
+                self._render_result(rep, kps, mirror)
+                return self._compose_result()
 
         if np.isnan(xy[A.NOSE, 0]):
             A.put_text(im, "No player detected - step back so your whole body is visible", (20, 40), 0.7, bg=(0, 0, 150))
@@ -137,22 +154,21 @@ class LiveAnalyzer:
         xy_d[:, 0] = (w - 1) - xy_d[:, 0]
         return cv2.flip(bgr, 1), xy_d
 
-    def _render_result(self, r: A.Report, kps: np.ndarray, mirror: bool) -> np.ndarray:
-        """Grade card + REDO button on the left; on the right, the swing as a 2x2 grid of snapshots
-        (load, trophy, contact, finish), each with the target-form shadow over the player."""
+    def _draw_demo(self, im, now):
+        """Top-right inset: the ideal stroke as a looping shadow figure, so you know what to aim for."""
+        h, w = im.shape[:2]
+        bw = max(120, min(170, w // 5))
+        bh = int(bw * 1.45)
+        A.draw_demo(im, self.stroke, (now / self.DEMO_LOOP_S) % 1.0, (w - bw - 10, 10, bw, bh))
+
+    def _render_result(self, r: A.Report, kps: np.ndarray, mirror: bool):
+        """Build everything the result screen needs once: the grade card on the left, the static snapshot and
+        key-moment grids, and the replay playlist (frame, seconds to show it)."""
         frames = [b[2] for b in self.buf]
         h, w = frames[0].shape[:2]
         pw = min(w // 2, 560)
-        cw = w - pw
+        cw, ph = w - pw, h - 22
         im, ox = np.full_like(frames[0], 25), 0
-        cols = 2
-        rows = max(1, -(-len(r.phases) // cols))
-        tw, th = cw // cols, (h - 20) // rows
-        for i, tile in enumerate(A.phase_strip(frames, r, (tw, th), mirror)):
-            x, y0 = pw + (i % cols) * tw, (i // cols) * th
-            im[y0:y0 + th, x:x + tw] = tile
-        A.put_text(im, "white shadow = target form   arrows = move this way", (pw + 8, h - 5), 0.4, (255, 255, 255),
-                   (0, 0, 0), 1)
         F = cv2.FONT_HERSHEY_SIMPLEX
         col = GRADE_COL.get(r.grade, (80, 80, 80))
         cv2.putText(im, r.grade, (ox + 24, 110), F, 3.6, col, 10, cv2.LINE_AA)
@@ -175,12 +191,12 @@ class LiveAnalyzer:
             cv2.rectangle(im, (bx, y - 12), (bx + bw, y), (70, 70, 70), -1)
             cv2.rectangle(im, (bx, y - 12), (bx + int(bw * c.points / 100), y), (0, 170, 0) if ok else (0, 120, 230), -1)
             cv2.putText(im, f"{c.points:.0f}", (bx + bw + 8, y), F, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
-            y += 26
+            y += 24
 
         y += 10
         if r.top_fix:
             cv2.putText(im, "Top fix:", (ox + 24, y), F, 0.6, (0, 200, 255), 2, cv2.LINE_AA); y += 26
-            for line in _wrap(r.top_fix, 52)[:4]:
+            for line in _wrap(r.top_fix, 52)[:3]:
                 cv2.putText(im, line, (ox + 24, y), F, 0.5, (255, 255, 255), 1, cv2.LINE_AA); y += 22
         else:
             cv2.putText(im, f"Clean {self.stroke} - nice form!", (ox + 24, y), F, 0.7, (0, 220, 0), 2, cv2.LINE_AA)
@@ -189,8 +205,51 @@ class LiveAnalyzer:
         bx0, by0, bx1, by1 = ox + 24, h - 70, ox + 224, h - 20
         cv2.rectangle(im, (bx0, by0), (bx1, by1), (0, 140, 255), -1)
         cv2.putText(im, "REDO  (R)", (bx0 + 30, by1 - 16), F, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(im, "Q to quit", (bx1 + 20, by1 - 16), F, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.putText(im, "V view   Q quit", (bx1 + 20, by1 - 16), F, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
         self.redo_rect = (bx0, by0, bx1, by1)
+        self.panel_rect = (pw, 0, w, ph)
+
+        def grid(tiles, cols):
+            g = np.full((ph, cw, 3), 25, np.uint8)
+            for i, tile in enumerate(tiles):
+                th_, tw_ = tile.shape[:2]
+                x, y0 = (i % cols) * tw_, (i // cols) * th_
+                g[y0:y0 + th_, x:x + tw_] = tile
+            return g
+
+        n = len(r.snapshots)
+        scols = 4 if n > 4 else max(1, n)
+        srows = max(1, -(-n // scols))
+        kcols = 2
+        krows = max(1, -(-len(r.phases) // kcols))
+        a, b = A.replay_span(r)
+        playlist = [(i, 1 / (r.fps * self.REPLAY_SPEED) + (self.KEY_HOLD_S if i in r.track.keys.values() else 0))
+                    for i in range(a, b + 1)]
+        playlist[-1] = (playlist[-1][0], playlist[-1][1] + 0.8)       # short pause before it loops
+        self.res = dict(
+            base=im, frames=frames, mirror=mirror, rep=r, span=(a, b), pw=pw, cw=cw, ph=ph,
+            t0=time.time(), idx=[p[0] for p in playlist], cum=np.cumsum([p[1] for p in playlist]),
+            static={"snapshots": grid(A.snapshot_strip(frames, r, (cw // scols, ph // srows), mirror), scols),
+                    "key moments": grid(A.phase_strip(frames, r, (cw // kcols, ph // krows), mirror), kcols)})
+
+    CAPTIONS = {"replay": "slow-mo replay: white shadow = target path, it follows your swing",
+                "snapshots": "8 snapshots across the swing, each scored vs the target path",
+                "key moments": "key moments: white shadow = target form, arrows = move this way"}
+
+    def _compose_result(self) -> np.ndarray:
+        R = self.res
+        im = R["base"].copy()
+        pw, cw, ph = R["pw"], R["cw"], R["ph"]
+        view = self.VIEWS[self.view]
+        if view == "replay":
+            t = (time.time() - R["t0"]) % R["cum"][-1]
+            i = R["idx"][min(int(np.searchsorted(R["cum"], t, side="right")), len(R["idx"]) - 1)]
+            im[:ph, pw:pw + cw] = A.replay_tile(R["frames"], R["rep"], i, (cw, ph), R["mirror"], R["span"])
+        else:
+            im[:ph, pw:pw + cw] = R["static"][view]
+        nxt = self.VIEWS[(self.view + 1) % len(self.VIEWS)]
+        A.put_text(im, f"{self.CAPTIONS[view]}   [V: {nxt}]", (pw + 8, im.shape[0] - 6), 0.4, (255, 255, 255),
+                   (0, 0, 0), 1)
         return im
 
     def close(self):
@@ -454,7 +513,7 @@ def main():
 
     drill = a.drill
     la = make(drill)
-    win = "Badminton coach (d = switch drill, r = redo / new session, c = recalibrate court, q = quit)"
+    win = "Badminton coach (d = switch drill, r = redo / new session, v = result view, c = recalibrate court, q = quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(win, lambda ev, x, y, *_: la.click(x, y) if ev == cv2.EVENT_LBUTTONDOWN else None)
     cv2.resizeWindow(win, 960, 540)
@@ -485,12 +544,14 @@ def main():
         nxt = DRILLS[(DRILLS.index(drill) + 1) % len(DRILLS)]
         A.put_text(out, f"D: switch to {nxt}", (out.shape[1] - 200, out.shape[0] - 55), 0.5, bg=(40, 40, 40), thick=1)
         cv2.imshow(win, out)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(15 if la.paused else 1) & 0xFF   # result screen: animate the replay, don't spin
         if key == ord("q"):
             break
         if key == ord("r"):
             la.reset()
             t_prev = time.time()
+        if key == ord("v") and hasattr(la, "next_view"):
+            la.next_view()
         if key == ord("c") and drill == "footwork":
             la.recalibrate()
         if key == ord("d"):
